@@ -3,8 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>語音口述填單</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <title>Speech Form Filling</title>
+    <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <header class="mobile-header">
@@ -19,6 +19,7 @@
       <div class="tabs">
         <button class="tab-button active" data-tab="stt">Real-time STT 模式</button>
         <button class="tab-button" data-tab="conversation">Conversation 模式</button>
+        <a class="tab-button" href="/logs.html">查看紀錄</a>
       </div>
 
       <section class="card" id="stt-tab">
@@ -62,6 +63,8 @@
           <div class="ride-header">
             <span>乘坐起點</span>
             <span>乘坐迄點</span>
+            <span>費用</span>
+            <span>乘坐事由</span>
             <span class="ride-remove">移除</span>
           </div>
           <div id="ride-rows"></div>
@@ -78,7 +81,10 @@
 
         <div class="card" style="margin-top: 20px">
           <div class="section-title"><span>六</span>備註說明</div>
-          <textarea id="field-notes" placeholder="請輸入"></textarea>
+          <div class="field">
+            <label>備註說明</label>
+            <textarea id="field-notes" placeholder="請輸入"></textarea>
+          </div>
         </div>
 
         <div class="card" style="margin-top: 20px">
@@ -109,12 +115,16 @@
       <section class="card" id="conversation-tab" style="display: none">
         <div class="section-title"><span>💬</span>Conversation 模式</div>
         <p class="status">
-          <span class="status-dot active"></span>
-          <span>Voice Agent 僅聆聽（不發聲），透過文字對話完成填單。</span>
+          <span class="status-dot" id="conversation-status-dot"></span>
+          <span id="conversation-status-text">等待開始語音</span>
         </p>
+        <div class="inline-actions" style="margin-top: 12px">
+          <button class="button" id="conversation-start">開始語音</button>
+          <button class="button secondary" id="conversation-stop">停止語音</button>
+        </div>
 
         <div class="card" style="margin-top: 20px">
-          <div class="section-title"><span>對話紀錄</span></div>
+          <div class="section-title text-only"><span>對話紀錄</span></div>
           <div class="chat" id="chat"></div>
           <div class="inline-actions" style="margin-top: 12px">
             <input id="chat-input" placeholder="輸入訊息" style="flex: 1" />
@@ -123,8 +133,8 @@
         </div>
 
         <div class="card" style="margin-top: 20px">
-          <div class="section-title"><span>Structured Output</span></div>
-          <pre id="structured-output" style="white-space: pre-wrap; font-size: 13px"></pre>
+          <div class="section-title text-only"><span>Structured Output</span></div>
+          <textarea id="structured-output" rows="10" placeholder="等待語音對話完成後產生"></textarea>
           <div class="inline-actions" style="margin-top: 12px">
             <button class="button secondary" id="generate-structure">重新產生</button>
             <button class="button" id="conversation-submit">送出申請</button>
@@ -134,6 +144,8 @@
       </section>
     </main>
 
-    <script src="/app.js"></script>
+    <button class="floating-next" id="stt-next-floating">下一個欄位</button>
+
+    <script src="/static/app.js"></script>
   </body>
 </html>

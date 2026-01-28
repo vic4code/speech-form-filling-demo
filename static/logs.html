@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Request Logs</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <header>
@@ -12,7 +12,7 @@
         <h1>Request Logs</h1>
         <p>檢視每筆 request 的 token 與成本資訊。</p>
         <div class="tabs">
-          <a class="tab-button" href="/index.html">返回填單</a>
+          <a class="tab-button" href="/">返回填單</a>
         </div>
       </div>
     </header>
@@ -20,11 +20,34 @@
     <main class="container">
       <section class="card">
         <div class="section-title"><span>📋</span>送出紀錄</div>
+        <div class="log-summary" id="log-summary">
+          <div class="summary-card">
+            <div class="summary-label">總筆數</div>
+            <div class="summary-value" id="summary-count">0</div>
+          </div>
+          <div class="summary-card cost">
+            <div class="summary-label">總成本</div>
+            <div class="summary-value" id="summary-cost">$0.000</div>
+          </div>
+          <div class="summary-card latest">
+            <div class="summary-label">平均填表時間</div>
+            <div class="summary-value" id="summary-avg-time">--</div>
+          </div>
+        </div>
+        <div class="log-toolbar">
+          <input id="log-search" class="log-search" placeholder="搜尋 Request ID / 內容關鍵字" />
+          <select id="log-mode" class="log-select">
+            <option value="all">所有模式</option>
+            <option value="stt">STT</option>
+            <option value="conversation">Conversation</option>
+          </select>
+          <button class="button secondary" id="log-refresh">重新整理</button>
+        </div>
         <div id="logs" class="log-list"></div>
         <div id="logs-empty" class="empty-state" style="display: none;">尚無送出紀錄</div>
       </section>
     </main>
 
-    <script src="/logs.js"></script>
+    <script src="/static/logs.js"></script>
   </body>
 </html>
