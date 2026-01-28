@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>語音口述填單</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="mobile-header">
+      <div class="header-bar">
+        <button class="icon-button" aria-label="返回">←</button>
+        <h1>表單填寫</h1>
+        <div class="header-spacer"></div>
+      </div>
+    </header>
+
+    <main class="container narrow">
+      <div class="tabs">
+        <button class="tab-button active" data-tab="stt">Real-time STT 模式</button>
+        <button class="tab-button" data-tab="conversation">Conversation 模式</button>
+      </div>
+
+      <section class="card" id="stt-tab">
+        <div class="section-title"><span>🎙️</span>即時 STT 填單模式</div>
+        <p class="status">
+          <span class="status-dot" id="stt-status-dot"></span>
+          <span id="stt-status-text">等待開始語音</span>
+          <span class="badge" id="stt-active-field">欄位：乘坐日期</span>
+        </p>
+
+        <div class="inline-actions">
+          <button class="button" id="stt-start">開始語音</button>
+          <button class="button secondary" id="stt-stop">停止語音</button>
+          <button class="button secondary" id="stt-next">下一個欄位</button>
+        </div>
+
+        <div class="card" style="margin-top: 20px">
+          <div class="section-title"><span>二</span>乘坐日期</div>
+          <div class="field">
+            <label>乘坐日期</label>
+            <input id="field-date" type="date" />
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 20px">
+          <div class="section-title"><span>三</span>乘坐類型</div>
+          <div class="field">
+            <label>乘坐類型</label>
+            <select id="field-ride-type">
+              <option value="">請選擇</option>
+              <option>01_單日單趟</option>
+              <option>02_單日來回</option>
+              <option>03_單日多趟(請於備註說明)</option>
+            </select>
+          </div>
+          <p class="hint">提醒：使用企業簽單者，請勿重複申請計程車資。</p>
+        </div>
+
+        <div class="card" style="margin-top: 20px">
+          <div class="section-title"><span>四</span>乘坐起迄地點</div>
+          <div class="ride-header">
+            <span>乘坐起點</span>
+            <span>乘坐迄點</span>
+            <span class="ride-remove">移除</span>
+          </div>
+          <div id="ride-rows"></div>
+          <button class="button ghost" id="add-ride">＋ 新增一列</button>
+        </div>
+
+        <div class="card" style="margin-top: 20px">
+          <div class="section-title"><span>五</span>當日車資合計</div>
+          <div class="field">
+            <label>車資合計</label>
+            <input id="field-total" type="number" placeholder="請輸入" />
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 20px">
+          <div class="section-title"><span>六</span>備註說明</div>
+          <textarea id="field-notes" placeholder="請輸入"></textarea>
+        </div>
+
+        <div class="card" style="margin-top: 20px">
+          <div class="section-title"><span>✅</span>審批流程</div>
+          <div class="approval-item">
+            <div>
+              <strong>申請人</strong>
+              <p>人工智慧科技科・陳奕惟</p>
+            </div>
+            <span class="approval-status">未提交</span>
+          </div>
+          <div class="approval-item">
+            <div>
+              <strong>專案經理</strong>
+              <p>數位數據暨科技發展中心數據暨人工智慧發展部・謝昌宏</p>
+            </div>
+            <span class="approval-status">--</span>
+          </div>
+        </div>
+
+        <div class="footer-actions">
+          <button class="button secondary" id="stt-review">暫存表單</button>
+          <button class="button primary" id="stt-submit">提交表單</button>
+        </div>
+        <span class="status" id="stt-submit-status"></span>
+      </section>
+
+      <section class="card" id="conversation-tab" style="display: none">
+        <div class="section-title"><span>💬</span>Conversation 模式</div>
+        <p class="status">
+          <span class="status-dot active"></span>
+          <span>Voice Agent 僅聆聽（不發聲），透過文字對話完成填單。</span>
+        </p>
+
+        <div class="card" style="margin-top: 20px">
+          <div class="section-title"><span>對話紀錄</span></div>
+          <div class="chat" id="chat"></div>
+          <div class="inline-actions" style="margin-top: 12px">
+            <input id="chat-input" placeholder="輸入訊息" style="flex: 1" />
+            <button class="button" id="chat-send">送出</button>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 20px">
+          <div class="section-title"><span>Structured Output</span></div>
+          <pre id="structured-output" style="white-space: pre-wrap; font-size: 13px"></pre>
+          <div class="inline-actions" style="margin-top: 12px">
+            <button class="button secondary" id="generate-structure">重新產生</button>
+            <button class="button" id="conversation-submit">送出申請</button>
+          </div>
+          <span class="status" id="conversation-status"></span>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
