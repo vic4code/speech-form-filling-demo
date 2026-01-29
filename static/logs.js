@@ -10,7 +10,7 @@ const logRefresh = document.getElementById("log-refresh");
 let allLogs = [];
 
 const formatDate = (iso) => new Date(iso).toLocaleString();
-const formatCost = (value) => `$${Number(value).toFixed(4)}`;
+const formatCost = (value) => `USD $${Number(value).toFixed(4)}`;
 const formatDurationSeconds = (value) => {
   if (!value) {
     return "--";

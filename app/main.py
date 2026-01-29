@@ -37,7 +37,8 @@ OPENAI_REALTIME_URL = os.getenv(
 )
 OPENAI_BETA_HEADER = os.getenv("OPENAI_BETA_HEADER", "realtime=v1")
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
-OPENAI_TRANSCRIBE_LANG = os.getenv("OPENAI_TRANSCRIBE_LANG", "zh")
+OPENAI_TRANSCRIBE_LANG = os.getenv("OPENAI_TRANSCRIBE_LANG", "zh-TW")
+OPENAI_TRANSCRIBE_PROMPT = os.getenv("OPENAI_TRANSCRIBE_PROMPT", "").strip()
 
 
 class TokenUsage(BaseModel):
@@ -180,8 +181,12 @@ def now_iso() -> str:
 @app.post("/api/requests", response_model=RequestRecord)
 def create_request(payload: RequestPayload) -> RequestRecord:
     started_at = datetime.now(timezone.utc)
-    tokens = estimate_tokens(payload.payload)
-    cost = estimate_cost(tokens)
+    if payload.mode == "stt":
+        tokens = TokenUsage(input=0, output=0)
+        cost = 0.0
+    else:
+        tokens = estimate_tokens(payload.payload)
+        cost = estimate_cost(tokens)
     user_duration_ms = 0
     audio_input_tokens = 0
     audio_output_tokens = 0
@@ -330,6 +335,7 @@ async def realtime_proxy(client_ws: WebSocket):
                     "input_audio_transcription": {
                         "model": OPENAI_TRANSCRIBE_MODEL,
                         "language": OPENAI_TRANSCRIBE_LANG,
+                        **({"prompt": OPENAI_TRANSCRIBE_PROMPT} if OPENAI_TRANSCRIBE_PROMPT else {}),
                     },
                     "turn_detection": {"type": "server_vad"},
                     "tools": [SUBMIT_FORM_TOOL],
@@ -516,17 +522,13 @@ async def realtime_stt(client_ws: WebSocket):
             session_update = {
                 "type": "session.update",
                 "session": {
-                    "type": "transcription",
-                    "audio": {
-                        "input": {
-                            "format": {"type": "audio/pcm", "rate": 24000},
-                            "transcription": {
-                                "model": OPENAI_TRANSCRIBE_MODEL,
-                                "language": OPENAI_TRANSCRIBE_LANG,
-                            },
-                            "turn_detection": {"type": "server_vad"},
-                        }
+                    "input_audio_format": "pcm16",
+                    "input_audio_transcription": {
+                        "model": OPENAI_TRANSCRIBE_MODEL,
+                        "language": OPENAI_TRANSCRIBE_LANG,
+                        **({"prompt": OPENAI_TRANSCRIBE_PROMPT} if OPENAI_TRANSCRIBE_PROMPT else {}),
                     },
+                    "turn_detection": {"type": "server_vad"},
                 },
             }
             await openai_ws.send(json.dumps(session_update))

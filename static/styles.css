@@ -297,7 +297,7 @@ textarea {
   display: none;
   position: fixed;
   right: 20px;
-  bottom: calc(20px + env(safe-area-inset-bottom));
+  bottom: calc(64px + env(safe-area-inset-bottom));
   z-index: 20;
   border: none;
   border-radius: 999px;
@@ -307,6 +307,27 @@ textarea {
   font-weight: 600;
   box-shadow: 0 12px 22px rgba(15, 23, 42, 0.18);
   cursor: pointer;
+}
+
+.floating-prev {
+  display: none;
+  position: fixed;
+  right: 20px;
+  bottom: calc(20px + env(safe-area-inset-bottom));
+  z-index: 20;
+  border: none;
+  border-radius: 999px;
+  padding: 12px 18px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 0 12px 22px rgba(15, 23, 42, 0.14);
+  cursor: pointer;
+}
+
+.floating-next:hover,
+.floating-prev:hover {
+  filter: brightness(0.95);
 }
 
 .approval-item {
@@ -567,6 +588,13 @@ textarea {
     right: 12px;
     left: 12px;
     bottom: calc(12px + env(safe-area-inset-bottom));
+    width: calc(100% - 24px);
+  }
+
+  .floating-prev {
+    right: 12px;
+    left: 12px;
+    bottom: calc(64px + env(safe-area-inset-bottom));
     width: calc(100% - 24px);
   }
 

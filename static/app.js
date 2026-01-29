@@ -7,7 +7,9 @@ const sttStatusText = document.getElementById("stt-status-text");
 const sttActiveField = document.getElementById("stt-active-field");
 const sttStart = document.getElementById("stt-start");
 const sttStop = document.getElementById("stt-stop");
+const sttPrev = document.getElementById("stt-prev");
 const sttNext = document.getElementById("stt-next");
+const sttPrevFloating = document.getElementById("stt-prev-floating");
 const sttNextFloating = document.getElementById("stt-next-floating");
 const sttSubmit = document.getElementById("stt-submit");
 const sttReview = document.getElementById("stt-review");
@@ -64,14 +66,16 @@ const rebuildFieldOrder = () => {
   }
 };
 
-const updateActiveField = () => {
+const updateActiveField = (shouldFocus = true) => {
   if (!fieldOrder.length) {
     rebuildFieldOrder();
   }
   const fieldId = fieldOrder[activeFieldIndex] || fieldOrder[0];
   const field = document.getElementById(fieldId);
   if (field) {
-    field.focus();
+    if (shouldFocus) {
+      field.focus();
+    }
     const label = field.closest(".field")?.querySelector("label")?.textContent;
     sttActiveField.textContent = `欄位：${label || ""}`;
   }
@@ -137,7 +141,14 @@ addRideRow();
 addRideButton.addEventListener("click", () => addRideRow());
 
 document.querySelectorAll("#stt-tab input, #stt-tab select, #stt-tab textarea").forEach((el) => {
-  el.addEventListener("focus", markSttFormStart);
+  el.addEventListener("focus", () => {
+    markSttFormStart();
+    const index = fieldOrder.indexOf(el.id);
+    if (index >= 0) {
+      activeFieldIndex = index;
+      updateActiveField(false);
+    }
+  });
   el.addEventListener("input", markSttFormStart);
   el.addEventListener("change", markSttFormStart);
 });
@@ -150,7 +161,17 @@ const goNextField = () => {
   updateActiveField();
 };
 
+const goPrevField = () => {
+  if (!fieldOrder.length) {
+    return;
+  }
+  activeFieldIndex = (activeFieldIndex - 1 + fieldOrder.length) % fieldOrder.length;
+  updateActiveField();
+};
+
+sttPrev.addEventListener("click", goPrevField);
 sttNext.addEventListener("click", goNextField);
+sttPrevFloating.addEventListener("click", goPrevField);
 sttNextFloating.addEventListener("click", goNextField);
 
 sttReview.addEventListener("click", () => {
@@ -430,6 +451,116 @@ const parseDateInput = (text) => {
   return `${year}-${month}-${day}`;
 };
 
+const parseChineseInteger = (text) => {
+  if (!text) {
+    return null;
+  }
+  const digitMap = {
+    零: 0,
+    一: 1,
+    二: 2,
+    兩: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+  const unitMap = {
+    十: 10,
+    百: 100,
+    千: 1000,
+    萬: 10000,
+  };
+  let total = 0;
+  let section = 0;
+  let number = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (digitMap[char] !== undefined) {
+      number = digitMap[char];
+      continue;
+    }
+    const unit = unitMap[char];
+    if (unit) {
+      if (unit === 10000) {
+        section = (section + (number || 0)) * unit;
+        total += section;
+        section = 0;
+        number = 0;
+      } else {
+        section += (number || 1) * unit;
+        number = 0;
+      }
+    }
+  }
+  return total + section + number;
+};
+
+const parseChineseNumber = (text) => {
+  const match = text.match(/[零一二三四五六七八九兩十百千萬點]+/);
+  if (!match) {
+    return null;
+  }
+  const token = match[0];
+  const digitMap = {
+    零: 0,
+    一: 1,
+    二: 2,
+    兩: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+  const colloquialMatch = token.match(/^([一二兩三四五六七八九])萬([一二兩三四五六七八九])$/);
+  if (colloquialMatch) {
+    return digitMap[colloquialMatch[1]] * 10000 + digitMap[colloquialMatch[2]] * 1000;
+  }
+  const thousandMatch = token.match(/^([一二兩三四五六七八九])千([一二兩三四五六七八九])$/);
+  if (thousandMatch) {
+    return digitMap[thousandMatch[1]] * 1000 + digitMap[thousandMatch[2]] * 100;
+  }
+  const hundredMatch = token.match(/^([一二兩三四五六七八九])百([一二兩三四五六七八九])$/);
+  if (hundredMatch) {
+    return digitMap[hundredMatch[1]] * 100 + digitMap[hundredMatch[2]] * 10;
+  }
+  const [intPart, decPart] = token.split("點");
+  const integerValue = parseChineseInteger(intPart) ?? 0;
+  if (!decPart) {
+    return integerValue;
+  }
+  let decimalDigits = "";
+  for (let i = 0; i < decPart.length; i += 1) {
+    const digit = digitMap[decPart[i]];
+    if (digit === undefined) {
+      continue;
+    }
+    decimalDigits += String(digit);
+  }
+  if (!decimalDigits) {
+    return integerValue;
+  }
+  return Number(`${integerValue}.${decimalDigits}`);
+};
+
+const parseNumericInput = (text) => {
+  const numeric = text.replace(/[^\d.]/g, "");
+  if (numeric && /^\d+(\.\d+)?$/.test(numeric)) {
+    return numeric;
+  }
+  const chineseParsed = parseChineseNumber(text);
+  if (chineseParsed === null || Number.isNaN(chineseParsed)) {
+    return "";
+  }
+  return String(chineseParsed);
+};
+
 const handleTranscript = (text) => {
   const normalized = text.toLowerCase();
   if (normalized.includes("下一個") || normalized.includes("next")) {
@@ -437,8 +568,7 @@ const handleTranscript = (text) => {
     return;
   }
   if (normalized.includes("上一個") || normalized.includes("previous")) {
-    activeFieldIndex = (activeFieldIndex - 1 + fieldOrder.length) % fieldOrder.length;
-    updateActiveField();
+    goPrevField();
     return;
   }
   const fieldId = fieldOrder[activeFieldIndex];
@@ -459,8 +589,20 @@ const handleTranscript = (text) => {
       }
     }
     if (field.type === "number") {
-      const numeric = text.replace(/[^\d.]/g, "");
-      field.value = numeric || text;
+      const numeric = parseNumericInput(text);
+      if (numeric) {
+        field.value = numeric;
+      }
+      return;
+    }
+    if (field.tagName === "TEXTAREA") {
+      const separator = field.value ? " " : "";
+      field.value = `${field.value}${separator}${text}`;
+      return;
+    }
+    if (field.type === "text" || field.tagName === "INPUT") {
+      const separator = field.value ? " " : "";
+      field.value = `${field.value}${separator}${text}`;
       return;
     }
     field.value = text;
@@ -674,6 +816,7 @@ const switchTab = (target) => {
   });
   sttTab.style.display = target === "stt" ? "block" : "none";
   conversationTab.style.display = target === "conversation" ? "block" : "none";
+  sttPrevFloating.style.display = target === "stt" ? "inline-flex" : "none";
   sttNextFloating.style.display = target === "stt" ? "inline-flex" : "none";
   if (target !== "stt" && listening) {
     stopSttRealtime();
