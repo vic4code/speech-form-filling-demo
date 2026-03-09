@@ -3,14 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Request Logs</title>
+    <title>Session Logs</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <header>
       <div class="container hero">
-        <h1>Request Logs</h1>
-        <p>檢視每筆 request 的 token 與成本資訊。</p>
+        <h1>Session Logs</h1>
+        <p>每次 WebSocket 連線的完整事件時序與表單提交記錄。</p>
         <div class="tabs">
           <a class="tab-button" href="/">返回填單</a>
         </div>
@@ -19,7 +19,7 @@
 
     <main class="container">
       <section class="card">
-        <div class="section-title"><span>📋</span>送出紀錄</div>
+        <div class="section-title"><span>📋</span>Session Logs</div>
         <div class="log-summary" id="log-summary">
           <div class="summary-card">
             <div class="summary-label">總筆數</div>
@@ -35,7 +35,7 @@
           </div>
         </div>
         <div class="log-toolbar">
-          <input id="log-search" class="log-search" placeholder="搜尋 Request ID / 內容關鍵字" />
+          <input id="log-search" class="log-search" placeholder="搜尋 Session ID / 內容關鍵字" />
           <select id="log-mode" class="log-select">
             <option value="all">所有模式</option>
             <option value="stt">STT</option>
@@ -44,10 +44,10 @@
           <button class="button secondary" id="log-refresh">重新整理</button>
         </div>
         <div id="logs" class="log-list"></div>
-        <div id="logs-empty" class="empty-state" style="display: none;">尚無送出紀錄</div>
+        <div id="logs-empty" class="empty-state" style="display: none;">尚無紀錄</div>
       </section>
     </main>
 
-    <script src="/static/logs.js?v=20260129"></script>
+    <script src="/static/logs.js?v=20260309"></script>
   </body>
 </html>

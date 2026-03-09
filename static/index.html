@@ -143,6 +143,17 @@
           <span class="status" id="conversation-status"></span>
         </div>
       </section>
+      <details id="session-debug-panel" hidden style="margin-top: 16px; padding: 0 16px 16px">
+        <summary style="cursor: pointer; font-size: 13px; color: #6b7280; padding: 4px 0;">
+          Session Debug Log
+        </summary>
+        <div id="session-debug-list" style="
+          margin-top: 8px; display: flex; flex-direction: column; gap: 6px;
+          font-size: 12px; font-family: monospace; background: #0f172a;
+          color: #e2e8f0; border-radius: 10px; padding: 10px 12px;
+          max-height: 200px; overflow-y: auto;
+        "></div>
+      </details>
     </main>
 
     <button class="floating-prev" id="stt-prev-floating">上一個欄位</button>

@@ -57,6 +57,8 @@ let sttAudioProcessor = null;
 let sttStream = null;
 let sttAudioSamplesTotal = 0;
 const AUDIO_TOKENS_PER_SECOND = 10;
+let sessionDebugLog = [];
+let _wsConnId = null;
 
 const rebuildFieldOrder = () => {
   const rideFields = Array.from(rideRowsContainer.querySelectorAll("input")).map((input) => input.id);
@@ -216,6 +218,50 @@ const stopSttAudio = () => {
   }
 };
 
+const _DEBUG_LABELS = {
+  "input_audio_buffer.speech_started": "SPEECH_START",
+  "input_audio_buffer.speech_stopped": "SPEECH_STOP",
+  "input_audio_buffer.committed":      "BUF_COMMIT",
+  "response.created":                  "RESP_START",
+  "response.done":                     "RESP_DONE",
+  "conversation.item.input_audio_transcription.completed": "TRANSCRIPT",
+};
+
+const _appendDebugRow = (badgeClass, badge, detail) => {
+  const panel = document.getElementById("session-debug-panel");
+  const list = document.getElementById("session-debug-list");
+  if (!panel || !list) return;
+  const item = document.createElement("div");
+  item.className = "session-debug-item";
+  item.innerHTML =
+    `<span class="session-debug-badge ${badgeClass}">${badge}</span>` +
+    `<span class="session-debug-ts">${new Date().toLocaleTimeString()}</span>` +
+    (detail ? `<code>${detail}</code>` : "");
+  list.prepend(item);
+  panel.removeAttribute("hidden");
+};
+
+const appendSessionEvent = (data) => {
+  sessionDebugLog.push(data);
+  if (data.event_type === "session.created" && data.conn_id) {
+    _wsConnId = data.conn_id;
+  }
+  const badge = data.event_type === "session.created" ? "CREATED" : "UPDATED";
+  const s = data.session || {};
+  _appendDebugRow(
+    "",
+    badge,
+    `id: ${s.id || "—"} | model: ${s.model || "—"} | modalities: ${(s.modalities || []).join(",")} | tools: ${s.tools_count ?? 0}`
+  );
+};
+
+const appendDebugEvent = (data) => {
+  const label = _DEBUG_LABELS[data.event_type] || data.event_type;
+  const d = data.data || {};
+  const detail = Object.entries(d).map(([k, v]) => `${k}: ${v}`).join(" | ");
+  _appendDebugRow("debug-badge-runtime", label, detail);
+};
+
 const startSttRealtime = async () => {
   if (sttSocket && sttSocket.readyState === WebSocket.OPEN) {
     return;
@@ -234,6 +280,10 @@ const startSttRealtime = async () => {
     } else if (data.type === "stt_done") {
       handleTranscript(data.content || "");
       sttStatusText.textContent = "語音辨識進行中";
+    } else if (data.type === "session_event") {
+      appendSessionEvent(data);
+    } else if (data.type === "debug_event") {
+      appendDebugEvent(data);
     } else if (data.type === "error") {
       setListeningState(false, data.message || "語音辨識發生錯誤，請稍後重試。");
       fetch("/api/client-errors", {
@@ -378,6 +428,10 @@ const startConversationRealtime = async () => {
       structuredOutput.value = JSON.stringify(conversationSubmittedPayload || {}, null, 2);
       conversationStatus.textContent = "表單已完成，請確認後送出。";
       stopConversationRealtime();
+    } else if (data.type === "session_event") {
+      appendSessionEvent(data);
+    } else if (data.type === "debug_event") {
+      appendDebugEvent(data);
     } else if (data.type === "error") {
       setConversationListeningState(false, data.message || "語音辨識發生錯誤，請稍後重試。");
       fetch("/api/client-errors", {
@@ -719,7 +773,7 @@ const submitRequest = async (mode, payload, statusEl) => {
     const response = await fetch("/api/requests", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode, payload, meta }),
+      body: JSON.stringify({ mode, payload, meta, connId: _wsConnId }),
     });
     if (!response.ok) {
       throw new Error("提交失敗");
