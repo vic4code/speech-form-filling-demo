@@ -6,6 +6,7 @@ import sqlite3
 import asyncio
 import base64
 import math
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,18 @@ OPENAI_REALTIME_URL = os.getenv(
 )
 OPENAI_BETA_HEADER = os.getenv("OPENAI_BETA_HEADER", "realtime=v1")
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
-OPENAI_TRANSCRIBE_LANG = os.getenv("OPENAI_TRANSCRIBE_LANG", "zh-TW")
+def normalize_transcribe_lang(raw: str) -> str:
+    """Normalize locale-like tags to supported base language codes."""
+    value = (raw or "").strip()
+    if not value:
+        return "zh"
+    # Convert tags like zh-TW/zh-Hant to zh, en-US to en, etc.
+    return value.split("-")[0].lower()
+
+
+OPENAI_TRANSCRIBE_LANG = normalize_transcribe_lang(
+    os.getenv("OPENAI_TRANSCRIBE_LANG", "zh")
+)
 OPENAI_TRANSCRIBE_PROMPT = os.getenv("OPENAI_TRANSCRIBE_PROMPT", "").strip()
 
 
@@ -64,6 +76,7 @@ class RequestPayload(BaseModel):
     mode: str = Field(..., pattern="^(stt|conversation)$")
     payload: dict[str, Any]
     meta: RequestMeta | None = None
+    connId: str | None = None
 
 
 class RequestRecord(BaseModel):
@@ -134,6 +147,31 @@ def init_db() -> None:
             conn.execute("ALTER TABLE requests ADD COLUMN audio_input_tokens INTEGER NOT NULL DEFAULT 0")
         if "audio_output_tokens" not in columns:
             conn.execute("ALTER TABLE requests ADD COLUMN audio_output_tokens INTEGER NOT NULL DEFAULT 0")
+        if "conn_id" not in columns:
+            conn.execute("ALTER TABLE requests ADD COLUMN conn_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_requests_conn ON requests (conn_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ws_events (
+                id TEXT PRIMARY KEY,
+                conn_id TEXT NOT NULL,
+                session_id TEXT,
+                endpoint TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ws_events_conn ON ws_events (conn_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ws_events_ts ON ws_events (created_at)"
+        )
 
 
 def row_to_record(row: sqlite3.Row) -> RequestRecord:
@@ -176,6 +214,204 @@ def estimate_audio_cost(audio_input_tokens: int, audio_output_tokens: int) -> fl
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_STREAM_EVENTS = frozenset({
+    "response.audio.delta",
+    "response.text.delta",
+    "response.output_text.delta",
+    "conversation.item.input_audio_transcription.delta",
+    "response.audio_transcript.delta",
+    "response.function_call_arguments.delta",
+})
+
+
+class RealtimeTurnLogger:
+    """State mirror for OpenAI Realtime API events — logs, persists, and summarises."""
+
+    def __init__(self, endpoint: str) -> None:
+        self.ep = endpoint
+        self.conn_id = str(uuid4())
+        self.openai_session_id: str | None = None
+        self._speech_start: float | None = None
+        self._user_transcript: str = ""
+        self._response_id: str | None = None
+        self._response_text: str = ""
+        self._response_audio_tr: str = ""
+        self._response_start: float | None = None
+
+    def _log(self, msg: str) -> None:
+        print(f"[{self.ep}] {msg}")
+
+    def log_out(self, payload: dict) -> None:
+        """Print outbound event to stdout and persist to DB."""
+        t = payload.get("type", "")
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+        if t == "input_audio_buffer.append":
+            chars = len(payload.get("audio", ""))
+            print(f"[{self.ep}] {ts} →OAI  {t}  ({chars} b64 chars)")
+            payload_json = None
+        else:
+            payload_str = json.dumps(payload, ensure_ascii=False, indent=2)
+            print(f"[{self.ep}] {ts} →OAI  {payload_str}")
+            payload_json = json.dumps(payload, ensure_ascii=False)
+        self._persist("out", t, payload_json)
+
+    def log_in(self, event: dict) -> None:
+        """Print inbound event to stdout and persist to DB."""
+        t = event.get("type", "")
+        if t in ("session.created", "session.updated") and not self.openai_session_id:
+            self.openai_session_id = (event.get("session") or {}).get("id")
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+        if t in _STREAM_EVENTS:
+            delta = event.get("delta", "")
+            print(f"[{self.ep}] {ts} ←OAI  {t}  ({len(delta)} chars)")
+            payload_json = None
+        else:
+            payload_str = json.dumps(event, ensure_ascii=False, indent=2)
+            print(f"[{self.ep}] {ts} ←OAI  {payload_str}")
+            payload_json = json.dumps(event, ensure_ascii=False)
+        self._persist("in", t, payload_json)
+
+    def _persist(self, direction: str, event_type: str, payload_json: str | None) -> None:
+        if payload_json is None:
+            return
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO ws_events VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    str(uuid4()),
+                    self.conn_id,
+                    self.openai_session_id,
+                    self.ep,
+                    direction,
+                    event_type,
+                    payload_json,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def on_event(self, event: dict) -> None:
+        t = event.get("type", "")
+
+        if t == "session.created":
+            s = event.get("session", {})
+            self._log(
+                f"SESSION CREATED  id={s.get('id')}  model={s.get('model')}  "
+                f"modalities={s.get('modalities')}  vad={s.get('turn_detection', {}).get('type')}"
+            )
+        elif t == "session.updated":
+            s = event.get("session", {})
+            self._log(
+                f"SESSION UPDATED  tools={len(s.get('tools', []))}  "
+                f"transcription_model={s.get('input_audio_transcription', {}).get('model')}"
+            )
+        elif t == "input_audio_buffer.speech_started":
+            self._speech_start = time.monotonic()
+            self._log("SPEECH START")
+        elif t == "input_audio_buffer.speech_stopped":
+            dur = f"  ({time.monotonic() - self._speech_start:.2f}s)" if self._speech_start else ""
+            self._log(f"SPEECH STOP{dur}")
+        elif t == "input_audio_buffer.committed":
+            self._log(f"BUF COMMIT  item_id={event.get('item_id')}")
+        elif t == "conversation.item.created":
+            item = event.get("item", {})
+            self._log(
+                f"ITEM CREATED  id={item.get('id')}  role={item.get('role')}  type={item.get('type')}"
+            )
+        elif t == "conversation.item.input_audio_transcription.delta":
+            self._user_transcript += event.get("delta", "")
+        elif t == "conversation.item.input_audio_transcription.completed":
+            tr = event.get("transcript", "")
+            self._user_transcript = ""
+            snippet = tr[:100] + ("…" if len(tr) > 100 else "")
+            self._log(f'TRANSCRIPT  "{snippet}"')
+        elif t == "response.created":
+            r = event.get("response", {})
+            self._response_id = r.get("id")
+            self._response_text = ""
+            self._response_audio_tr = ""
+            self._response_start = time.monotonic()
+            self._log(f"RESPONSE START  id={self._response_id}")
+        elif t == "response.output_item.added":
+            item = event.get("item", {})
+            self._log(f"OUTPUT ITEM  type={item.get('type')}  role={item.get('role')}")
+        elif t in ("response.text.delta", "response.output_text.delta"):
+            self._response_text += event.get("delta", "")
+        elif t == "response.audio_transcript.delta":
+            self._response_audio_tr += event.get("delta", "")
+        elif t == "response.audio_transcript.done":
+            tr = event.get("transcript") or self._response_audio_tr
+            self._log(f'AUDIO TRANSCRIPT  "{tr[:100]}{"…" if len(tr) > 100 else ""}"')
+        elif t == "response.done":
+            r = event.get("response", {})
+            usage = r.get("usage") or {}
+            dur = f"  {time.monotonic() - self._response_start:.2f}s" if self._response_start else ""
+            text = self._response_text
+            in_det = usage.get("input_token_details") or {}
+            out_det = usage.get("output_token_details") or {}
+            self._log(
+                f"RESPONSE DONE  id={r.get('id')}  status={r.get('status')}{dur}\n"
+                f"  tokens → in={usage.get('input_tokens')}"
+                f" (audio={in_det.get('audio_tokens')})"
+                f"  out={usage.get('output_tokens')}"
+                f" (audio={out_det.get('audio_tokens')})\n"
+                f'  text: "{text[:100]}{"…" if len(text) > 100 else ""}"'
+            )
+            self._response_id = None
+            self._response_text = ""
+        elif t == "rate_limits.updated":
+            limits = {lim["name"]: lim.get("remaining") for lim in event.get("rate_limits", [])}
+            self._log(f"RATE LIMITS  {limits}")
+
+
+async def forward_debug_event(event: dict, safe_send) -> None:
+    """Forward a lightweight runtime debug event to the frontend."""
+    t = event.get("type", "")
+    data: dict = {}
+    if t == "conversation.item.input_audio_transcription.completed":
+        tr = event.get("transcript", "")
+        data = {"text": tr[:60] + ("…" if len(tr) > 60 else "")}
+    elif t == "response.created":
+        data = {"id": ((event.get("response") or {}).get("id") or "")[-8:]}
+    elif t == "response.done":
+        r = event.get("response") or {}
+        usage = r.get("usage") or {}
+        data = {"status": r.get("status", ""), "tokens": usage.get("output_tokens")}
+    await safe_send({"type": "debug_event", "event_type": t, "data": data})
+
+
+async def forward_session_event(
+    event: dict, safe_send, endpoint: str, conn_id: str
+) -> None:
+    """Log session lifecycle events to stdout and forward to frontend."""
+    event_type = event.get("type")
+    session = event.get("session", {})
+    print(
+        f"[{endpoint}] {event_type}: id={session.get('id')} "
+        f"model={session.get('model')} "
+        f"modalities={session.get('modalities')} "
+        f"tools={len(session.get('tools', []))} tool(s)"
+    )
+    await safe_send({
+        "type": "session_event",
+        "event_type": event_type,
+        "conn_id": conn_id,
+        "session": {
+            "id": session.get("id"),
+            "model": session.get("model"),
+            "modalities": session.get("modalities"),
+            "input_audio_format": session.get("input_audio_format"),
+            "turn_detection": session.get("turn_detection"),
+            "tools_count": len(session.get("tools", [])),
+        },
+    })
+
+
+async def ws_send(ws, payload: dict, logger: RealtimeTurnLogger) -> None:
+    """Log and send a client event to OpenAI."""
+    logger.log_out(payload)
+    await ws.send(json.dumps(payload))
 
 
 @app.post("/api/requests", response_model=RequestRecord)
@@ -234,9 +470,10 @@ def create_request(payload: RequestPayload) -> RequestRecord:
             """
             INSERT INTO requests (
                 id, mode, payload_json, token_usage_json, cost, processing_ms,
-                user_duration_ms, audio_input_tokens, audio_output_tokens, created_at
+                user_duration_ms, audio_input_tokens, audio_output_tokens, created_at,
+                conn_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -249,6 +486,7 @@ def create_request(payload: RequestPayload) -> RequestRecord:
                 record.audioInputTokens,
                 record.audioOutputTokens,
                 record.createdAt,
+                payload.connId,
             ),
         )
     return record
@@ -322,6 +560,7 @@ async def realtime_proxy(client_ws: WebSocket):
         async with websockets.connect(
             OPENAI_REALTIME_URL, additional_headers=headers
         ) as openai_ws:
+            logger = RealtimeTurnLogger("realtime")
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -342,7 +581,7 @@ async def realtime_proxy(client_ws: WebSocket):
                     "tool_choice": "auto",
                 },
             }
-            await openai_ws.send(json.dumps(session_update))
+            await ws_send(openai_ws, session_update, logger)
 
             tool_call_buffers: dict[str, str] = {}
             client_started_at: datetime | None = None
@@ -364,13 +603,10 @@ async def realtime_proxy(client_ws: WebSocket):
                                 audio_samples_total += len(audio_bytes) // 2
                             except (ValueError, TypeError):
                                 pass
-                            await openai_ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "input_audio_buffer.append",
-                                        "audio": message["audio"],
-                                    }
-                                )
+                            await ws_send(
+                                openai_ws,
+                                {"type": "input_audio_buffer.append", "audio": message["audio"]},
+                                logger,
                             )
                         elif "meta" in message:
                             started_at = message.get("meta", {}).get("startedAt")
@@ -381,21 +617,19 @@ async def realtime_proxy(client_ws: WebSocket):
                                 except ValueError:
                                     client_started_at = None
                         elif "text" in message:
-                            await openai_ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "conversation.item.create",
-                                        "item": {
-                                            "type": "message",
-                                            "role": "user",
-                                            "content": [
-                                                {"type": "input_text", "text": message["text"]}
-                                            ],
-                                        },
-                                    }
-                                )
+                            await ws_send(
+                                openai_ws,
+                                {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "message",
+                                        "role": "user",
+                                        "content": [{"type": "input_text", "text": message["text"]}],
+                                    },
+                                },
+                                logger,
                             )
-                            await openai_ws.send(json.dumps({"type": "response.create"}))
+                            await ws_send(openai_ws, {"type": "response.create"}, logger)
                 except WebSocketDisconnect:
                     return
                 except Exception as exc:
@@ -406,12 +640,16 @@ async def realtime_proxy(client_ws: WebSocket):
                     async for raw in openai_ws:
                         event = json.loads(raw)
                         event_type = event.get("type")
+                        logger.log_in(event)
+                        logger.on_event(event)
                         if event_type in ("response.output_text.delta", "response.text.delta"):
                             await safe_send(
                                 {"type": "agent_delta", "content": event.get("delta", "")}
                             )
                         elif event_type in ("response.output_text.done", "response.done"):
                             await safe_send({"type": "agent_done"})
+                            if event_type == "response.done":
+                                await forward_debug_event(event, safe_send)
                         elif event_type == "conversation.item.input_audio_transcription.delta":
                             await safe_send(
                                 {"type": "user_delta", "content": event.get("delta", "")}
@@ -426,6 +664,7 @@ async def realtime_proxy(client_ws: WebSocket):
                                     "content": event.get("transcript", ""),
                                 }
                             )
+                            await forward_debug_event(event, safe_send)
                         elif event_type == "response.function_call_arguments.delta":
                             call_id = event.get("call_id", "default")
                             tool_call_buffers[call_id] = tool_call_buffers.get(
@@ -468,25 +707,32 @@ async def realtime_proxy(client_ws: WebSocket):
                                         "meta": meta.model_dump() if meta else None,
                                     }
                                 )
-                                await openai_ws.send(
-                                    json.dumps(
-                                        {
-                                            "type": "conversation.item.create",
-                                            "item": {
-                                                "type": "function_call_output",
-                                                "call_id": call_id,
-                                                "output": json.dumps(
-                                                    {
-                                                        "status": "pending_user_confirmation",
-                                                        "message": "已整理表單，等待使用者確認送出。",
-                                                    }
-                                                ),
-                                            },
-                                        }
-                                    )
+                                await ws_send(
+                                    openai_ws,
+                                    {
+                                        "type": "conversation.item.create",
+                                        "item": {
+                                            "type": "function_call_output",
+                                            "call_id": call_id,
+                                            "output": json.dumps({
+                                                "status": "pending_user_confirmation",
+                                                "message": "已整理表單，等待使用者確認送出。",
+                                            }),
+                                        },
+                                    },
+                                    logger,
                                 )
                             except Exception as exc:
                                 await safe_send({"type": "error", "message": str(exc)})
+                        elif event_type in ("session.created", "session.updated"):
+                            await forward_session_event(event, safe_send, "realtime", logger.conn_id)
+                        elif event_type in (
+                            "input_audio_buffer.speech_started",
+                            "input_audio_buffer.speech_stopped",
+                            "input_audio_buffer.committed",
+                            "response.created",
+                        ):
+                            await forward_debug_event(event, safe_send)
                         elif event_type == "error":
                             await safe_send({"type": "error", "message": str(event)})
                 except Exception as exc:
@@ -519,6 +765,7 @@ async def realtime_stt(client_ws: WebSocket):
         async with websockets.connect(
             OPENAI_REALTIME_URL, additional_headers=headers
         ) as openai_ws:
+            logger = RealtimeTurnLogger("realtime-stt")
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -531,7 +778,7 @@ async def realtime_stt(client_ws: WebSocket):
                     "turn_detection": {"type": "server_vad"},
                 },
             }
-            await openai_ws.send(json.dumps(session_update))
+            await ws_send(openai_ws, session_update, logger)
 
             async def receive_from_client():
                 try:
@@ -539,13 +786,10 @@ async def realtime_stt(client_ws: WebSocket):
                         data = await client_ws.receive_text()
                         message = json.loads(data)
                         if "audio" in message:
-                            await openai_ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "input_audio_buffer.append",
-                                        "audio": message["audio"],
-                                    }
-                                )
+                            await ws_send(
+                                openai_ws,
+                                {"type": "input_audio_buffer.append", "audio": message["audio"]},
+                                logger,
                             )
                 except WebSocketDisconnect:
                     return
@@ -557,6 +801,8 @@ async def realtime_stt(client_ws: WebSocket):
                     async for raw in openai_ws:
                         event = json.loads(raw)
                         event_type = event.get("type")
+                        logger.log_in(event)
+                        logger.on_event(event)
                         if event_type == "conversation.item.input_audio_transcription.delta":
                             await safe_send(
                                 {"type": "stt_delta", "content": event.get("delta", "")}
@@ -568,8 +814,16 @@ async def realtime_stt(client_ws: WebSocket):
                                     "content": event.get("transcript", ""),
                                 }
                             )
+                            await forward_debug_event(event, safe_send)
+                        elif event_type in ("session.created", "session.updated"):
+                            await forward_session_event(event, safe_send, "realtime-stt", logger.conn_id)
+                        elif event_type in (
+                            "input_audio_buffer.speech_started",
+                            "input_audio_buffer.speech_stopped",
+                            "input_audio_buffer.committed",
+                        ):
+                            await forward_debug_event(event, safe_send)
                         elif event_type == "error":
-                            print(f"[realtime-stt] OpenAI error: {event}")
                             await safe_send({"type": "error", "message": str(event)})
                 except Exception as exc:
                     await safe_send({"type": "error", "message": str(exc)})
@@ -590,6 +844,98 @@ def delete_request(request_id: str) -> dict[str, str]:
     if cursor.rowcount == 0:
         raise HTTPException(status_code=404, detail="Request not found")
     return {"status": "ok"}
+
+
+@app.get("/api/sessions")
+def list_sessions() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                ws.conn_id, ws.session_id, ws.endpoint,
+                ws.event_count, ws.started_at, ws.last_event_at,
+                req.id              AS req_id,
+                req.mode            AS req_mode,
+                req.cost            AS req_cost,
+                req.token_usage_json,
+                req.payload_json    AS req_payload_json,
+                req.user_duration_ms,
+                req.created_at      AS req_created_at
+            FROM (
+                SELECT conn_id, session_id, endpoint,
+                       COUNT(*) AS event_count,
+                       MIN(created_at) AS started_at,
+                       MAX(created_at) AS last_event_at
+                FROM ws_events
+                GROUP BY conn_id
+            ) ws
+            LEFT JOIN requests req ON req.conn_id = ws.conn_id
+            ORDER BY ws.started_at DESC
+            """
+        ).fetchall()
+        orphans = conn.execute(
+            """
+            SELECT id, mode, cost, token_usage_json, payload_json,
+                   user_duration_ms, created_at
+            FROM requests
+            WHERE conn_id IS NULL
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+
+    result = []
+    for row in rows:
+        d = dict(row)
+        d["token_usage"] = json.loads(d.pop("token_usage_json") or "{}")
+        d["req_payload"] = json.loads(d.pop("req_payload_json") or "null")
+        result.append(d)
+    for row in orphans:
+        d = dict(row)
+        result.append({
+            "conn_id": None,
+            "session_id": None,
+            "endpoint": "—",
+            "event_count": 0,
+            "started_at": d["created_at"],
+            "last_event_at": d["created_at"],
+            "req_id": d["id"],
+            "req_mode": d["mode"],
+            "req_cost": d["cost"],
+            "token_usage": json.loads(d.get("token_usage_json") or "{}"),
+            "req_payload": json.loads(d.get("payload_json") or "null"),
+            "user_duration_ms": d["user_duration_ms"],
+            "req_created_at": d["created_at"],
+        })
+    return result
+
+
+@app.get("/api/ws-sessions")
+def list_ws_sessions() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT conn_id, session_id, endpoint,
+                   COUNT(*) AS event_count,
+                   MIN(created_at) AS started_at,
+                   MAX(created_at) AS last_event_at
+            FROM ws_events
+            GROUP BY conn_id
+            ORDER BY started_at DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/ws-sessions/{conn_id}/events")
+def get_ws_session_events(conn_id: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM ws_events WHERE conn_id = ? ORDER BY created_at ASC",
+            (conn_id,),
+        ).fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return [dict(row) for row in rows]
 
 
 @app.post("/api/client-errors")

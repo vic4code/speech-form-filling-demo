@@ -602,3 +602,54 @@ textarea {
     grid-template-columns: 1fr;
   }
 }
+
+.session-debug-badge {
+  display: inline-block;
+  background: rgba(33, 179, 107, 0.25);
+  color: #21b36b;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-weight: 700;
+  margin-right: 6px;
+}
+
+.session-debug-ts {
+  color: #94a3b8;
+  margin-right: 8px;
+}
+
+.session-debug-badge.debug-badge-runtime {
+  background: rgba(148, 163, 184, 0.2);
+  color: #94a3b8;
+}
+
+.ws-event-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 12px;
+  font-family: monospace;
+}
+.ws-dir {
+  font-weight: 700;
+  min-width: 40px;
+}
+.ws-out { color: #60a5fa; }
+.ws-in  { color: #34d399; }
+.ws-events-list {
+  padding: 8px 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.ws-event-row details {
+  min-width: 0;
+  width: 100%;
+}
+.ws-event-row details pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+}
