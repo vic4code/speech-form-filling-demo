@@ -561,10 +561,25 @@ async def realtime_proxy(client_ws: WebSocket):
             OPENAI_REALTIME_URL, additional_headers=headers
         ) as openai_ws:
             logger = RealtimeTurnLogger("realtime")
+
+            async def safe_send(payload: dict[str, Any]) -> None:
+                if client_ws.client_state.name == "CONNECTED":
+                    await client_ws.send_json(payload)
+
+            # Read session.created BEFORE sending anything so log order matches
+            # actual network order: ←OAI session.created → →OAI session.update
+            raw = await openai_ws.recv()
+            init_event = json.loads(raw)
+            logger.log_in(init_event)
+            logger.on_event(init_event)
+            if init_event.get("type") in ("session.created", "session.updated"):
+                await forward_session_event(init_event, safe_send, "realtime", logger.conn_id)
+
             session_update = {
                 "type": "session.update",
                 "session": {
-                    "modalities": ["text"],
+                    "modalities": ["text", "audio"],
+                    "output_audio_format": "pcm16",
                     "instructions": (
                         "你是表單助理，請用對話引導使用者完成計程車費報銷表單。"
                         "務必確認所有欄位都有值後，才呼叫 submit_form。"
@@ -586,10 +601,6 @@ async def realtime_proxy(client_ws: WebSocket):
             tool_call_buffers: dict[str, str] = {}
             client_started_at: datetime | None = None
             audio_samples_total = 0
-
-            async def safe_send(payload: dict[str, Any]) -> None:
-                if client_ws.client_state.name == "CONNECTED":
-                    await client_ws.send_json(payload)
 
             async def receive_from_client():
                 nonlocal client_started_at, audio_samples_total
@@ -642,7 +653,12 @@ async def realtime_proxy(client_ws: WebSocket):
                         event_type = event.get("type")
                         logger.log_in(event)
                         logger.on_event(event)
-                        if event_type in ("response.output_text.delta", "response.text.delta"):
+                        if event_type == "response.audio.delta":
+                            await safe_send({
+                                "type": "audio_delta",
+                                "delta": event.get("delta", ""),
+                            })
+                        elif event_type in ("response.output_text.delta", "response.text.delta", "response.audio_transcript.delta"):
                             await safe_send(
                                 {"type": "agent_delta", "content": event.get("delta", "")}
                             )
@@ -766,6 +782,16 @@ async def realtime_stt(client_ws: WebSocket):
             OPENAI_REALTIME_URL, additional_headers=headers
         ) as openai_ws:
             logger = RealtimeTurnLogger("realtime-stt")
+
+            # Read session.created BEFORE sending anything so log order matches
+            # actual network order: ←OAI session.created → →OAI session.update
+            raw = await openai_ws.recv()
+            init_event = json.loads(raw)
+            logger.log_in(init_event)
+            logger.on_event(init_event)
+            if init_event.get("type") in ("session.created", "session.updated"):
+                await forward_session_event(init_event, safe_send, "realtime-stt", logger.conn_id)
+
             session_update = {
                 "type": "session.update",
                 "session": {

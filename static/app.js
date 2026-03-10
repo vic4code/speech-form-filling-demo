@@ -59,6 +59,8 @@ let sttAudioSamplesTotal = 0;
 const AUDIO_TOKENS_PER_SECOND = 10;
 let sessionDebugLog = [];
 let _wsConnId = null;
+let conversationAudioPlayCtx = null;
+let conversationNextPlayTime = 0;
 
 const rebuildFieldOrder = () => {
   const rideFields = Array.from(rideRowsContainer.querySelectorAll("input")).map((input) => input.id);
@@ -428,6 +430,9 @@ const startConversationRealtime = async () => {
       structuredOutput.value = JSON.stringify(conversationSubmittedPayload || {}, null, 2);
       conversationStatus.textContent = "表單已完成，請確認後送出。";
       stopConversationRealtime();
+    } else if (data.type === "audio_delta") {
+      console.log("[audio] ← audio_delta received, base64 length:", data.delta?.length, "ctx state:", conversationAudioPlayCtx?.state);
+      playAudioDelta(data.delta);
     } else if (data.type === "session_event") {
       appendSessionEvent(data);
     } else if (data.type === "debug_event") {
@@ -468,12 +473,43 @@ const startConversationRealtime = async () => {
   };
 };
 
+const playAudioDelta = async (base64) => {
+  if (!conversationAudioPlayCtx) {
+    console.warn("[audio] playAudioDelta: no AudioContext!");
+    return;
+  }
+  if (conversationAudioPlayCtx.state === "suspended") {
+    console.log("[audio] context suspended, resuming…");
+    await conversationAudioPlayCtx.resume();
+    console.log("[audio] resumed, state now:", conversationAudioPlayCtx.state);
+  }
+  const raw = atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  const pcm16 = new Int16Array(bytes.buffer);
+  const float32 = new Float32Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768.0;
+  const buffer = conversationAudioPlayCtx.createBuffer(1, float32.length, 24000);
+  buffer.getChannelData(0).set(float32);
+  const source = conversationAudioPlayCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(conversationAudioPlayCtx.destination);
+  const now = conversationAudioPlayCtx.currentTime;
+  if (conversationNextPlayTime < now) conversationNextPlayTime = now + 0.05;
+  console.log(`[audio] scheduling chunk: samples=${float32.length}, dur=${buffer.duration.toFixed(3)}s, schedAt=${conversationNextPlayTime.toFixed(3)}, ctxNow=${now.toFixed(3)}`);
+  source.start(conversationNextPlayTime);
+  conversationNextPlayTime += buffer.duration;
+};
+
 const stopConversationRealtime = () => {
   stopConversationAudio();
   if (conversationSocket) {
     conversationSocket.close();
     conversationSocket = null;
   }
+  conversationAudioPlayCtx?.close();
+  conversationAudioPlayCtx = null;
+  conversationNextPlayTime = 0;
   setConversationListeningState(false, "已停止語音");
 };
 
@@ -677,8 +713,13 @@ sttStop.addEventListener("click", () => {
 });
 
 conversationStart.addEventListener("click", () => {
-  if (conversationListening) {
-    return;
+  if (conversationListening) return;
+  // Create playback AudioContext synchronously inside user gesture to satisfy autoplay policy
+  if (!conversationAudioPlayCtx) {
+    conversationAudioPlayCtx = new AudioContext({ sampleRate: 24000 });
+    conversationNextPlayTime = conversationAudioPlayCtx.currentTime;
+  } else if (conversationAudioPlayCtx.state === "suspended") {
+    conversationAudioPlayCtx.resume();
   }
   startConversationRealtime();
 });
