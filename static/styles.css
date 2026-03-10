@@ -19,6 +19,7 @@ body {
   font-family: "Noto Sans TC", "Inter", system-ui, -apple-system, sans-serif;
   color: var(--text);
   background: var(--bg);
+  overflow-x: hidden;
 }
 
 header {
@@ -393,6 +394,7 @@ textarea {
 .log-list {
   display: grid;
   gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .log-summary {
@@ -475,6 +477,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
 }
 
 .log-meta {
@@ -542,6 +545,8 @@ textarea {
   border-radius: 12px;
   overflow-x: auto;
   margin: 10px 0 0;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .empty-state {
@@ -641,15 +646,16 @@ textarea {
 .ws-in  { color: #34d399; }
 .ws-events-list {
   padding: 8px 0;
-  max-width: 100%;
-  overflow: hidden;
+  width: 100%;
+  overflow-x: auto;
 }
 .ws-event-row details {
   min-width: 0;
   width: 100%;
 }
 .ws-event-row details pre {
-  max-width: 100%;
+  white-space: pre-wrap;
+  word-break: break-all;
   overflow-x: auto;
-  white-space: pre;
+  box-sizing: border-box;
 }
