@@ -2,12 +2,12 @@
 
 ## Overview
 
-A voice-first web application for completing taxi expense reimbursement forms. Users can fill forms via real-time speech-to-text or conversational AI, with optional **Guardrail** safety checks powered by LiteLLM.
+A voice-first web application for completing taxi expense reimbursement forms. Users can fill forms via real-time speech-to-text or conversational AI, with optional **Guardrail** safety checks.
 
-The application provides **two voice-driven modes** via tabs:
+Two voice-driven modes are available:
 
-1. **Real-time STT Form Mode**: Streaming speech-to-text fills form fields in sequence with block-level focus and voice navigation.
-2. **Conversation Mode**: A Realtime voice agent guides the user through the form via natural dialogue. The conversation produces structured output that **automatically populates a live form preview** alongside the chat, then submits as a request.
+1. **Real-time STT Form Mode** — Streaming speech-to-text fills form fields in sequence with block-level focus and voice navigation.
+2. **Conversation Mode** — A Realtime voice agent guides the user through the form via natural dialogue. Structured output **automatically populates a live form preview** alongside the chat.
 
 After submission, users are redirected to a **Request Log page** with token usage, cost tracking, and WebSocket event history.
 
@@ -19,9 +19,9 @@ After submission, users are redirected to a **Request Log page** with token usag
 │  (HTML/JS)   │   audio + events        │  Server       │   audio + events      │  API             │
 └─────────────┘                          │              │                       └─────────────────┘
                                          │  ┌──────────┐│
-                                         │  │Guardrails││       HTTP/WS         ┌─────────────────┐
-                                         │  │ Module   ││ ◄──────────────────► │  LiteLLM Proxy   │
-                                         │  └──────────┘│                       │  (optional)      │
+                                         │  │Guardrail ││       WebSocket       ┌─────────────────┐
+                                         │  │ Module   ││ ◄──────────────────► │  Audio Guardrail │
+                                         │  └──────────┘│   PCM16 16kHz         │  Server          │
                                          └──────────────┘                       └─────────────────┘
 ```
 
@@ -29,60 +29,59 @@ After submission, users are redirected to a **Request Log page** with token usag
 
 ### Conversation Mode with Live Form Preview
 
-The conversation tab uses a **split layout**:
-- **Left panel**: Chat dialogue with the AI agent + structured JSON output
-- **Right panel**: Live form preview that auto-populates when the agent completes the form
+The conversation tab uses a **form-centric layout**:
+- **Left (60%)** — Full form (identical structure to STT mode) that auto-populates when AI completes filling
+- **Right (40%)** — Sticky chat sidebar showing conversation with the AI agent
 
-When the agent calls `submit_form`, the structured output fills both the JSON textarea and the visual form fields (date, ride type, ride rows, total fare, notes), giving the user a clear preview before submission.
+When the agent calls `submit_form`, the structured output fills the visual form fields (date, ride type, ride rows, total fare, notes) with a highlight animation, giving the user a clear preview before submission.
 
 ### Guardrail Integration
 
-Two guardrail modes protect against unsafe or policy-violating content. Both modes share the **same output text guardrail**; they only differ in how **input** is checked.
+Two guardrail modes protect against unsafe or policy-violating content. Both modes share the **same output text guardrail**; they differ only in how **input** is checked.
 
 #### Mode 1: Input Audio Guardrail + Output Text Guardrail
 
-Input 檢查方式：將 **原始音訊** 送到外部 Guardrail WebSocket 端點 (`GUARDRAIL_WS_URL`) 進行檢查。
+Streams raw audio to an external guardrail WebSocket endpoint (`GUARDRAIL_WS_URL`) for real-time audio-level safety checks.
 
 ```
-User Audio ──► buffer per speech turn
-                    │
-                    ▼  (buffer committed)
-              Audio Guardrail WS ◄── ws://guardrail-server/ws/audio/guardrails
-                    │
-              ┌─────┴─────┐
-              │ Pass      │ Block
-              ▼           ▼
-        Forward to    Cancel response
-        Realtime API      │
-              │           ▼
-              │     Notify user "已攔截"
-              ▼
-        Agent Output ──► Output Text Guardrail (via LiteLLM)
-                              │
-                        ┌─────┴─────┐
-                        │ Pass      │ Block
-                        ▼           ▼
-                   Forward     Show blocked msg
+User Audio ──► Realtime API + stream to Audio Guardrail WS (PCM16, 16kHz)
+                    │                          │
+                    │                    ┌─────┴─────┐
+                    │                    │ SAFE      │ UNSAFE
+                    │                    ▼           ▼
+                    │               Continue    Show warning popup
+                    │                              + stop conversation
+                    ▼
+              Agent Output ──► Output Text Guardrail (pattern check)
+                                    │
+                              ┌─────┴─────┐
+                              │ Pass      │ Block
+                              ▼           ▼
+                         Forward     Show blocked msg
 ```
+
+- Dual-stream: both user input audio and AI output audio are sent to the guardrail server
+- Audio is resampled from 24kHz to 16kHz (numpy linear interpolation) per guardrail server requirements
+- Protocol: binary PCM16 frames sent over WebSocket; server returns `{"event": "guardrail_result", "status": "SAFE"|"UNSAFE"}`
+- Based on [DScathay/voice-guardrails](https://github.com/DScathay/voice-guardrails) realtime branch
 
 #### Mode 2: Input Transcript Guardrail + Output Text Guardrail
 
-Input 檢查方式：音訊直接送 Realtime API，拿到 `input_audio_transcription.completed` 的 **transcript 文字** 再過 text guardrail。
+Audio goes directly to Realtime API. The `input_audio_transcription.completed` transcript text is checked via local pattern-based guardrail before triggering AI response.
 
 ```
-User Audio ──► Realtime API (直接送)
+User Audio ──► Realtime API (create_response: false)
                     │
                     ▼  (transcription completed)
-              Input Text Guardrail (via LiteLLM)
+              Input Text Guardrail (pattern check)
                     │
               ┌─────┴─────┐
               │ Pass      │ Block
               ▼           ▼
-         Forward to    Show "[已攔截]"
-         chat            in chat
-              │
+        response.create   Show warning popup
+              │              + stop conversation
               ▼
-        Agent Output ──► Output Text Guardrail (via LiteLLM)  ← 同 Mode 1
+        Agent Output ──► Output Text Guardrail (pattern check)
                               │
                         ┌─────┴─────┐
                         │ Pass      │ Block
@@ -90,13 +89,27 @@ User Audio ──► Realtime API (直接送)
                    Forward     Show blocked msg
 ```
 
-#### Output Guardrail（兩個模式共用）
+- `create_response: false` in `turn_detection` prevents AI from responding before guardrail check completes
+- After guardrail passes, `response.create` is sent manually
+- Based on [DScathay/voice-guardrails](https://github.com/DScathay/voice-guardrails) asr branch and [vic4code/realtime-litellm-guardrail](https://github.com/vic4code/realtime-litellm-guardrail)
 
-不論 Mode 1 或 Mode 2，Agent 的回應 transcript (`response.audio_transcript.done`) 都會經過 **Output Text Guardrail**（透過 LiteLLM `/v1/chat/completions` + guardrail headers）。
+#### Output Guardrail (shared by both modes)
 
-#### Guardrail Fallback
+Agent response transcript (`response.audio_transcript.done`) is checked via the same local pattern-based guardrail.
 
-When LiteLLM is not configured, a **local keyword-based guardrail** can be used via the `GUARDRAIL_BLOCK_KEYWORDS` environment variable (comma-separated list).
+#### Local Pattern-Based Guardrail
+
+The built-in text guardrail detects the following categories without any external service:
+
+| Category | Example triggers |
+|---|---|
+| Prompt injection | "ignore previous instructions", "忽略你的指令", "jailbreak", "DAN" |
+| PII / data exfiltration | "API key", "密碼", "列出所有使用者資料" |
+| Abuse / profanity | "幹你娘", "fuck you", "kill yourself" |
+| Code injection | `DROP TABLE`, `<script>`, `UNION SELECT`, `1=1` |
+| Expense fraud | "幫我多報金額", "虛報費用", "不要留下紀錄" |
+
+When triggered, the conversation stops immediately and an orange warning popup appears (auto-dismiss after 8 seconds).
 
 ### Real-time STT Form Mode
 
@@ -116,108 +129,58 @@ When LiteLLM is not configured, a **local keyword-based guardrail** can be used 
 | Variable | Default | Description |
 |---|---|---|
 | `OPENAI_API_KEY` | (required) | OpenAI API key |
-| `OPENAI_REALTIME_URL` | `wss://api.openai.com/v1/realtime?model=gpt-realtime` | Realtime API WebSocket URL |
+| `OPENAI_REALTIME_MODEL` | `gpt-4o-realtime-preview-2024-12-17` | Default Realtime API model |
 | `OPENAI_BETA_HEADER` | `realtime=v1` | OpenAI-Beta header value |
-| `OPENAI_TRANSCRIBE_MODEL` | `gpt-4o-transcribe` | Transcription model |
+| `OPENAI_TRANSCRIBE_MODEL` | `whisper-1` | Transcription model (Realtime API native) |
 | `OPENAI_TRANSCRIBE_LANG` | `zh` | Transcription language |
-| `OPENAI_TRANSCRIBE_PROMPT` | (empty) | Optional transcription prompt |
-| `COST_PER_1K_INPUT` | `0.004` | Text input token cost per 1K |
-| `COST_PER_1K_OUTPUT` | `0.016` | Text output token cost per 1K |
-| `AUDIO_COST_PER_1K_INPUT` | `0.032` | Audio input token cost per 1K |
-| `AUDIO_COST_PER_1K_OUTPUT` | `0.064` | Audio output token cost per 1K |
-| `AUDIO_TOKENS_PER_SECOND` | `10` | Audio tokens per second estimate |
-| **Guardrail Variables** | | |
-| `LITELLM_BASE_URL` | (empty) | LiteLLM proxy base URL (e.g. `http://localhost:4000`) |
-| `LITELLM_API_KEY` | (empty) | LiteLLM proxy API key |
-| `LITELLM_MASTER_KEY` | (empty) | LiteLLM proxy master key |
-| `LITELLM_GUARDRAIL_NAME` | (empty) | Guardrail name(s) to apply (sent as `x-litellm-guardrails` header) |
-| `LITELLM_TEXT_MODEL` | `gpt-4o-mini` | Model for text guardrail checks |
-| `GUARDRAIL_API_KEY` | (empty) | External audio guardrail service API key |
-| `GUARDRAIL_WS_URL` | (empty) | External audio guardrail WebSocket URL |
-| `GUARDRAIL_BLOCK_KEYWORDS` | (empty) | Comma-separated keywords for local fallback guardrail |
+| **Guardrail** | | |
+| `GUARDRAIL_WS_URL` | (empty) | Audio guardrail WebSocket URL (Mode 1) |
+| `GUARDRAIL_API_KEY` | (empty) | Audio guardrail service API key |
+| `GUARDRAIL_BLOCK_KEYWORDS` | (empty) | Additional comma-separated blocked keywords |
+
+## Available Realtime Models
+
+Pricing sourced from OpenAI (via LiteLLM model registry, March 2025):
+
+| Model | Text In/Out (per 1M) | Audio In/Out (per 1M) |
+|---|---|---|
+| `gpt-4o-realtime-preview-2024-12-17` | $5.50 / $22.00 | $44.00 / $80.00 |
+| `gpt-4o-realtime-preview-2024-10-01` | $5.50 / $22.00 | $110.00 / $220.00 |
+| `gpt-4o-mini-realtime-preview-2024-12-17` | $0.66 / $2.64 | $11.00 / $22.00 |
+
+The model can be selected from the dropdown in the UI before starting a session.
 
 ## Quick Start
 
-> 所有服務都透過 `uv` 管理，不需要另外 `pip install`。
-
-### Step 1: 安裝依賴
+### Step 1: Install dependencies
 
 ```bash
 uv sync
 ```
 
-### Step 2: 設定 `.env`
+### Step 2: Configure `.env`
 
 ```env
-# 必要
+# Required
 OPENAI_API_KEY=sk-proj-...
 
-# LiteLLM (text guardrail 用)
-LITELLM_BASE_URL=http://localhost:4000
-LITELLM_MASTER_KEY=sk-master-key-1234
-LITELLM_GUARDRAIL_NAME=my-guardrail
-LITELLM_TEXT_MODEL=gpt-4o-mini
-
-# 外部 Audio Guardrail WebSocket (Mode 1 用)
+# Audio Guardrail (Mode 1)
 GUARDRAIL_API_KEY=your-api-key
 GUARDRAIL_WS_URL=ws://your-server:8889/ws/audio/guardrails
 ```
 
-### Step 3: 啟動服務（需要兩個 Terminal）
-
-**Terminal 1 — LiteLLM Proxy (port 4000)**
-
-```bash
-LITELLM_CONFIG_FILE=litellm_config.yaml uv run uvicorn litellm.proxy.proxy_server:app --port 4000 --loop asyncio
-```
-
-> 如果看到 `Uvicorn running on http://0.0.0.0:4000` 表示啟動成功。
-
-**Terminal 2 — App (port 8000)**
+### Step 3: Start the app
 
 ```bash
 uv run uvicorn app.main:app --reload --port 8000
 ```
 
-### Step 4: 開啟瀏覽器
+### Step 4: Open browser
 
-- 表單頁面: http://localhost:8000/
-- 請求紀錄: http://localhost:8000/logs.html
+- Form page: http://localhost:8000/
+- Request logs: http://localhost:8000/logs.html
 
-預設會進入 **Conversation 模式**。勾選 Guardrail checkbox 可啟用安全檢查。
-
-### 只跑 App（不需要 Guardrail）
-
-如果不需要 Guardrail 功能，只開一個 Terminal：
-
-```bash
-uv sync
-uv run uvicorn app.main:app --reload --port 8000
-```
-
-不勾選 UI 上的 Guardrail checkbox 即可正常使用。
-
-## LiteLLM Config
-
-專案根目錄的 `litellm_config.yaml` 已預設好：
-
-```yaml
-model_list:
-  - model_name: gpt-4o-mini
-    litellm_params:
-      model: openai/gpt-4o-mini
-      api_key: os.environ/OPENAI_API_KEY
-
-guardrails:
-  - guardrail_name: my-guardrail
-    litellm_params:
-      guardrail: aporia        # 替換為你的 guardrail provider
-      mode: [pre_call, post_call]
-      default_on: true
-```
-
-可根據需求替換 guardrail provider（支援 Aporia、Lakera、Presidio、自訂 Python class 等）。
-詳見 [LiteLLM Guardrails 文件](https://docs.litellm.ai/docs/proxy/guardrails)。
+Default mode is **Conversation**. Check the **Guardrail** checkbox to enable safety checks.
 
 ## API Endpoints
 
@@ -230,6 +193,8 @@ guardrails:
 | `GET` | `/api/sessions` | List unified sessions (WS + requests) |
 | `GET` | `/api/ws-sessions` | List WebSocket sessions |
 | `GET` | `/api/ws-sessions/:conn_id/events` | Get events for a WS session |
+| `GET` | `/api/models` | List available Realtime models with pricing |
+| `GET` | `/api/guardrail-info` | Get guardrail endpoint configuration |
 | `POST` | `/api/client-errors` | Log frontend errors |
 
 ## WebSocket Endpoints
@@ -237,6 +202,7 @@ guardrails:
 | Path | Description |
 |---|---|
 | `/ws/realtime` | Conversation mode — full duplex audio + text + tools |
-| `/ws/realtime?guardrail=pre_check` | Conversation mode with Mode 1 guardrails |
-| `/ws/realtime?guardrail=post_check` | Conversation mode with Mode 2 guardrails |
+| `/ws/realtime?guardrail=pre_check` | Conversation + Mode 1 (audio input guardrail) |
+| `/ws/realtime?guardrail=post_check` | Conversation + Mode 2 (transcript input guardrail) |
+| `/ws/realtime?model=<model_id>` | Conversation with specific Realtime model |
 | `/ws/realtime-stt` | STT-only mode — transcription only |
