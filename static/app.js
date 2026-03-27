@@ -1,6 +1,7 @@
 const tabButtons = document.querySelectorAll(".tab-button[data-tab]");
 const sttTab = document.getElementById("stt-tab");
 const conversationTab = document.getElementById("conversation-tab");
+const mainContainer = document.querySelector(".container.narrow");
 
 const sttStatusDot = document.getElementById("stt-status-dot");
 const sttStatusText = document.getElementById("stt-status-text");
@@ -61,6 +62,168 @@ let sessionDebugLog = [];
 let _wsConnId = null;
 let conversationAudioPlayCtx = null;
 let conversationNextPlayTime = 0;
+
+// Model selector
+const modelSelect = document.getElementById("model-select");
+(async () => {
+  try {
+    const resp = await fetch("/api/models");
+    const data = await resp.json();
+    data.models.forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = m.id;
+      if (m.id === data.default) opt.selected = true;
+      modelSelect.appendChild(opt);
+    });
+  } catch (e) {
+    const opt = document.createElement("option");
+    opt.value = "gpt-4o-realtime-preview-2024-12-17";
+    opt.textContent = "GPT-4o Realtime (default)";
+    modelSelect.appendChild(opt);
+  }
+})();
+
+// Guardrail state
+const guardrailEnabled = document.getElementById("guardrail-enabled");
+const guardrailModeSelect = document.getElementById("guardrail-mode");
+const guardrailStatusEl = document.getElementById("guardrail-status");
+const guardrailWarningEl = document.getElementById("guardrail-warning");
+const guardrailWarningMsg = document.getElementById("guardrail-warning-msg");
+const guardrailInfoEl = document.getElementById("guardrail-info");
+
+const updateGuardrailInfo = () => {
+  if (!guardrailEnabled.checked) {
+    guardrailInfoEl.style.display = "none";
+    return;
+  }
+  fetch("/api/guardrail-info").then(r => r.json()).then(info => {
+    const mode = guardrailModeSelect.value;
+    const lines = [];
+    if (mode === "pre_check") {
+      lines.push(`<b>Input:</b> Audio → ${info.audio_ws || "(未設定)"}`);
+    } else {
+      lines.push(`<b>Input:</b> Transcript → Local pattern check`);
+    }
+    lines.push(`<b>Output:</b> Agent transcript → Local pattern check`);
+    guardrailInfoEl.innerHTML = lines.join("&nbsp;&nbsp;|&nbsp;&nbsp;");
+    guardrailInfoEl.style.display = "block";
+  }).catch(() => { guardrailInfoEl.style.display = "none"; });
+};
+
+guardrailModeSelect.addEventListener("change", updateGuardrailInfo);
+
+guardrailEnabled.addEventListener("change", () => {
+  guardrailModeSelect.classList.toggle("visible", guardrailEnabled.checked);
+  guardrailStatusEl.className = "guardrail-status";
+  guardrailStatusEl.textContent = "";
+  updateGuardrailInfo();
+});
+
+const showGuardrailWarning = (message) => {
+  // Popup banner (auto-dismiss 8s)
+  guardrailWarningMsg.textContent = message;
+  guardrailWarningEl.classList.remove("hidden");
+  setTimeout(() => guardrailWarningEl.classList.add("hidden"), 8000);
+};
+
+const addGuardrailChatMessage = (message) => {
+  // Add orange message to chat
+  conversationMessages.push({ role: "guardrail", content: message });
+  renderChat();
+};
+
+const showGuardrailStatus = (state, message) => {
+  guardrailStatusEl.style.display = "flex";
+  guardrailStatusEl.className = `guardrail-status ${state}`;
+  guardrailStatusEl.textContent = message;
+};
+
+// Smart date parser for conversation form (handles various AI output formats)
+const parseConvDate = (raw) => {
+  if (!raw) return "";
+  // Already YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  // Try parseDateInput (handles 年月日, slashes, etc.)
+  const parsed = parseDateInput(raw);
+  if (parsed) return parsed;
+  // Try native Date parse as last resort
+  const d = new Date(raw);
+  if (!isNaN(d.getTime())) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+  return raw;
+};
+
+// Smart ride type matcher (fuzzy match AI output to select options)
+const matchConvRideType = (raw) => {
+  if (!raw) return "";
+  const options = ["01_單日單趟", "02_單日來回", "03_單日多趟(請於備註說明)"];
+  // Exact match
+  if (options.includes(raw)) return raw;
+  // Fuzzy match by keyword
+  const normalized = raw.replace(/\s+/g, "");
+  if (normalized.includes("來回")) return "02_單日來回";
+  if (normalized.includes("多趟")) return "03_單日多趟(請於備註說明)";
+  if (normalized.includes("單趟") || normalized.includes("單程")) return "01_單日單趟";
+  // Match by prefix number
+  if (normalized.startsWith("01") || normalized.startsWith("1")) return "01_單日單趟";
+  if (normalized.startsWith("02") || normalized.startsWith("2")) return "02_單日來回";
+  if (normalized.startsWith("03") || normalized.startsWith("3")) return "03_單日多趟(請於備註說明)";
+  // Default: guess from ride count in payload context (handled by caller)
+  return "";
+};
+
+// Conversation form population — fills the always-visible form
+const populateConversationForm = (payload) => {
+  if (!payload) return;
+
+  // Date — smart parse
+  const dateEl = document.getElementById("conv-field-date");
+  const parsedDate = parseConvDate(payload.rideDate);
+  if (parsedDate) dateEl.value = parsedDate;
+
+  // Ride type — fuzzy match
+  const typeEl = document.getElementById("conv-field-ride-type");
+  let matchedType = matchConvRideType(payload.rideType);
+  // Auto-detect from ride rows if no match
+  if (!matchedType && payload.rideRows) {
+    const count = payload.rideRows.length;
+    if (count === 1) matchedType = "01_單日單趟";
+    else if (count === 2) matchedType = "02_單日來回";
+    else if (count > 2) matchedType = "03_單日多趟(請於備註說明)";
+  }
+  if (matchedType) typeEl.value = matchedType;
+
+  // Ride rows
+  const rowsContainer = document.getElementById("conv-ride-rows");
+  rowsContainer.innerHTML = "";
+  if (payload.rideRows && payload.rideRows.length) {
+    payload.rideRows.forEach((row, idx) => addConvRideRow(row, idx));
+  }
+
+  // Total
+  const totalEl = document.getElementById("conv-field-total");
+  if (payload.totalFare) totalEl.value = String(payload.totalFare).replace(/[^\d.]/g, "");
+
+  // Notes
+  const notesEl = document.getElementById("conv-field-notes");
+  if (payload.notes) notesEl.value = payload.notes;
+
+  // Approval
+  const approvalEl = document.getElementById("conv-approval-status");
+  if (approvalEl) approvalEl.textContent = "待確認";
+
+  // Highlight filled fields
+  setTimeout(() => {
+    document.querySelectorAll(".conversation-form-panel input, .conversation-form-panel select, .conversation-form-panel textarea").forEach((el) => {
+      if (el.value && el.value !== "請選擇") {
+        el.classList.add("field-filled");
+        setTimeout(() => el.classList.remove("field-filled"), 1500);
+      }
+    });
+  }, 50);
+};
 
 const rebuildFieldOrder = () => {
   const rideFields = Array.from(rideRowsContainer.querySelectorAll("input")).map((input) => input.id);
@@ -375,7 +538,13 @@ const startConversationRealtime = async () => {
     return;
   }
   const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
-  conversationSocket = new WebSocket(`${wsProtocol}://${window.location.host}/ws/realtime`);
+  const params = new URLSearchParams();
+  params.set("model", modelSelect.value);
+  if (guardrailEnabled.checked) {
+    params.set("guardrail", guardrailModeSelect.value);
+  }
+  let wsUrl = `${wsProtocol}://${window.location.host}/ws/realtime?${params.toString()}`;
+  conversationSocket = new WebSocket(wsUrl);
   conversationSocket.onopen = async () => {
     setConversationListeningState(true, "已連線，語音辨識進行中");
     markConversationFormStart();
@@ -428,11 +597,30 @@ const startConversationRealtime = async () => {
       conversationSubmittedPayload = data.payload || null;
       conversationPendingMeta = data.meta || null;
       structuredOutput.value = JSON.stringify(conversationSubmittedPayload || {}, null, 2);
+      structuredOutput.hidden = false;
       conversationStatus.textContent = "表單已完成，請確認後送出。";
+      populateConversationForm(conversationSubmittedPayload);
       stopConversationRealtime();
     } else if (data.type === "audio_delta") {
       console.log("[audio] ← audio_delta received, base64 length:", data.delta?.length, "ctx state:", conversationAudioPlayCtx?.state);
       playAudioDelta(data.delta);
+    } else if (data.type === "guardrail_result") {
+      const dir = data.direction === "output" ? "Output" : "Input";
+      const dirLabel = data.direction === "output" ? "輸出" : "輸入";
+      if (data.passed) {
+        showGuardrailStatus("safe", `✓ ${dir} Guardrail: ${data.message || "通過"}`);
+      } else {
+        // BLOCKED: show popup + chat message + stop conversation
+        const blockMsg = data.message || "此內容違反安全規範";
+        showGuardrailStatus("blocked", `✗ ${dir} Guardrail: ${blockMsg}`);
+        showGuardrailWarning(`${dirLabel}安全防護：${blockMsg}`);
+        addGuardrailChatMessage(`BLOCKED: ${blockMsg}`);
+        // Stop the conversation
+        stopConversationRealtime();
+      }
+    } else if (data.type === "guardrail_checking") {
+      const dir = data.direction === "output" ? "Output" : "Input";
+      showGuardrailStatus("checking", `⋯ ${dir} Guardrail ${data.message || "檢查中..."}`);
     } else if (data.type === "session_event") {
       appendSessionEvent(data);
     } else if (data.type === "debug_event") {
@@ -893,7 +1081,8 @@ chatInput.addEventListener("keydown", (event) => {
 });
 
 generateStructure.addEventListener("click", () => {
-  generateStructuredOutput();
+  const payload = generateStructuredOutput();
+  populateConversationForm(payload);
 });
 
 conversationSubmit.addEventListener("click", async () => {
@@ -925,9 +1114,24 @@ tabButtons.forEach((button) => {
   button.addEventListener("click", () => switchTab(button.dataset.tab));
 });
 
-const initialTab = document.querySelector(".tab-button.active")?.dataset.tab || "stt";
+const initialTab = document.querySelector(".tab-button.active")?.dataset.tab || "conversation";
 switchTab(initialTab);
 
 renderChat();
 rebuildFieldOrder();
 updateActiveField();
+
+// Initialize default empty ride row in conversation form
+const addConvRideRow = (data = {}, idx = 0) => {
+  const convRows = document.getElementById("conv-ride-rows");
+  const row = document.createElement("div");
+  row.className = "conv-ride-row";
+  row.innerHTML = `
+    <div class="field"><label class="mobile-only">起點</label><input placeholder="請輸入" value="${data.from || ""}" /></div>
+    <div class="field"><label class="mobile-only">迄點</label><input placeholder="請輸入" value="${data.to || ""}" /></div>
+    <div class="field"><label class="mobile-only">費用</label><input type="number" placeholder="請輸入" value="${data.fee || ""}" /></div>
+    <div class="field"><label class="mobile-only">事由</label><input placeholder="請輸入" value="${data.reason || ""}" /></div>
+  `;
+  convRows.appendChild(row);
+};
+addConvRideRow();

@@ -21,23 +21,68 @@ from starlette.websockets import WebSocketDisconnect
 from dotenv import load_dotenv
 import websockets
 
+from app.guardrails import (
+    check_text as guardrail_check_text,
+    AudioGuardrailSession,
+    GuardrailResult,
+    is_configured as guardrail_is_configured,
+)
+
 
 load_dotenv()
 
-# Default to gpt-realtime text token pricing (per 1K tokens).
-# Input: $4.00 / 1M, Output: $16.00 / 1M
-COST_PER_1K_INPUT = float(os.getenv("COST_PER_1K_INPUT", "0.004"))
-COST_PER_1K_OUTPUT = float(os.getenv("COST_PER_1K_OUTPUT", "0.016"))
-AUDIO_COST_PER_1K_INPUT = float(os.getenv("AUDIO_COST_PER_1K_INPUT", "0.032"))
-AUDIO_COST_PER_1K_OUTPUT = float(os.getenv("AUDIO_COST_PER_1K_OUTPUT", "0.064"))
-AUDIO_TOKENS_PER_SECOND = float(os.getenv("AUDIO_TOKENS_PER_SECOND", "10"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_REALTIME_URL = os.getenv(
-    "OPENAI_REALTIME_URL",
-    "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+# ── Realtime model definitions with official pricing (per 1K tokens) ──
+# Source: https://platform.openai.com/docs/pricing (March 2025)
+REALTIME_MODELS: dict[str, dict] = {
+    "gpt-4o-realtime-preview-2024-12-17": {
+        "label": "GPT-4o Realtime (2024-12-17)",
+        "text_input_per_1k": 0.0055,      # $5.50 / 1M
+        "text_output_per_1k": 0.022,       # $22.00 / 1M
+        "audio_input_per_1k": 0.044,       # $44.00 / 1M
+        "audio_output_per_1k": 0.08,       # $80.00 / 1M
+    },
+    "gpt-4o-realtime-preview-2024-10-01": {
+        "label": "GPT-4o Realtime (2024-10-01)",
+        "text_input_per_1k": 0.0055,       # $5.50 / 1M
+        "text_output_per_1k": 0.022,       # $22.00 / 1M
+        "audio_input_per_1k": 0.11,        # $110.00 / 1M
+        "audio_output_per_1k": 0.22,       # $220.00 / 1M
+    },
+    "gpt-4o-mini-realtime-preview-2024-12-17": {
+        "label": "GPT-4o Mini Realtime (2024-12-17)",
+        "text_input_per_1k": 0.00066,      # $0.66 / 1M
+        "text_output_per_1k": 0.00264,     # $2.64 / 1M
+        "audio_input_per_1k": 0.011,       # $11.00 / 1M
+        "audio_output_per_1k": 0.022,      # $22.00 / 1M
+    },
+}
+
+DEFAULT_REALTIME_MODEL = os.getenv(
+    "OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17"
 )
+
+
+def _get_model_pricing(model: str) -> dict:
+    return REALTIME_MODELS.get(model, REALTIME_MODELS[DEFAULT_REALTIME_MODEL])
+
+
+def _realtime_url(model: str) -> str:
+    """Build the OpenAI Realtime WebSocket URL for a given model."""
+    base = os.getenv("OPENAI_REALTIME_BASE_URL", "wss://api.openai.com/v1/realtime")
+    return f"{base}?model={model}"
+
+
+# Derive legacy cost constants from default model for backward compat
+_default_pricing = _get_model_pricing(DEFAULT_REALTIME_MODEL)
+COST_PER_1K_INPUT = _default_pricing["text_input_per_1k"]
+COST_PER_1K_OUTPUT = _default_pricing["text_output_per_1k"]
+AUDIO_COST_PER_1K_INPUT = _default_pricing["audio_input_per_1k"]
+AUDIO_COST_PER_1K_OUTPUT = _default_pricing["audio_output_per_1k"]
+AUDIO_TOKENS_PER_SECOND = float(os.getenv("AUDIO_TOKENS_PER_SECOND", "50"))
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BETA_HEADER = os.getenv("OPENAI_BETA_HEADER", "realtime=v1")
-OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
 def normalize_transcribe_lang(raw: str) -> str:
     """Normalize locale-like tags to supported base language codes."""
     value = (raw or "").strip()
@@ -516,28 +561,35 @@ def get_request(request_id: str) -> RequestRecord:
 SUBMIT_FORM_TOOL = {
     "type": "function",
     "name": "submit_form",
-    "description": "當所有欄位完整時，送出計程車費報銷表單。",
+    "description": "當所有欄位完整時，送出計程車費報銷表單。rideDate 和 rideType 為必填，不可為空。",
     "parameters": {
         "type": "object",
         "properties": {
-            "rideDate": {"type": "string", "description": "乘坐日期，YYYY-MM-DD"},
-            "rideType": {"type": "string", "description": "乘坐類型"},
+            "rideDate": {
+                "type": "string",
+                "description": "乘坐日期，格式必須為 YYYY-MM-DD，例如 2026-03-27。若使用者未提供，請先詢問。",
+            },
+            "rideType": {
+                "type": "string",
+                "enum": ["01_單日單趟", "02_單日來回", "03_單日多趟(請於備註說明)"],
+                "description": "乘坐類型，必須為以下三選一：01_單日單趟、02_單日來回、03_單日多趟(請於備註說明)。根據使用者描述的趟數判斷。",
+            },
             "rideRows": {
                 "type": "array",
-                "description": "乘坐起迄明細",
+                "description": "乘坐起迄明細，至少一筆",
                 "items": {
                     "type": "object",
                     "properties": {
                         "from": {"type": "string", "description": "乘坐起點"},
                         "to": {"type": "string", "description": "乘坐迄點"},
-                        "fee": {"type": "string", "description": "費用"},
+                        "fee": {"type": "string", "description": "費用（數字）"},
                         "reason": {"type": "string", "description": "乘坐事由"},
                     },
                     "required": ["from", "to", "fee", "reason"],
                 },
             },
-            "totalFare": {"type": "string", "description": "當日車資合計"},
-            "notes": {"type": "string", "description": "備註說明"},
+            "totalFare": {"type": "string", "description": "當日車資合計（數字）"},
+            "notes": {"type": "string", "description": "備註說明，可為空字串"},
         },
         "required": ["rideDate", "rideType", "rideRows", "totalFare", "notes"],
     },
@@ -552,13 +604,17 @@ async def realtime_proxy(client_ws: WebSocket):
         await client_ws.close()
         return
 
+    # Parse query params: ?guardrail=pre_check|post_check&model=gpt-4o-realtime-preview-2024-12-17
+    guardrail_mode = client_ws.query_params.get("guardrail")
+    selected_model = client_ws.query_params.get("model", DEFAULT_REALTIME_MODEL)
+
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     if OPENAI_BETA_HEADER:
         headers["OpenAI-Beta"] = OPENAI_BETA_HEADER
 
     try:
         async with websockets.connect(
-            OPENAI_REALTIME_URL, additional_headers=headers
+            _realtime_url(selected_model), additional_headers=headers
         ) as openai_ws:
             logger = RealtimeTurnLogger("realtime")
 
@@ -566,8 +622,6 @@ async def realtime_proxy(client_ws: WebSocket):
                 if client_ws.client_state.name == "CONNECTED":
                     await client_ws.send_json(payload)
 
-            # Read session.created BEFORE sending anything so log order matches
-            # actual network order: ←OAI session.created → →OAI session.update
             raw = await openai_ws.recv()
             init_event = json.loads(raw)
             logger.log_in(init_event)
@@ -581,17 +635,33 @@ async def realtime_proxy(client_ws: WebSocket):
                     "modalities": ["text", "audio"],
                     "output_audio_format": "pcm16",
                     "instructions": (
-                        "你是表單助理，請用對話引導使用者完成計程車費報銷表單。"
-                        "務必確認所有欄位都有值後，才呼叫 submit_form。"
-                        "若使用者資訊不完整，請追問缺少欄位。"
+                        "你是計程車費報銷表單助理。請用繁體中文對話引導使用者完成表單。\n"
+                        "必填欄位：\n"
+                        "1. 乘坐日期（必須問清楚具體日期，格式 YYYY-MM-DD）\n"
+                        "2. 乘坐類型（根據趟數判斷：單趟=01_單日單趟，來回=02_單日來回，多趟=03_單日多趟）\n"
+                        "3. 每趟的起點、迄點、費用、事由\n"
+                        "4. 車資合計\n"
+                        "規則：\n"
+                        "- 若使用者沒提到日期，務必追問「請問是哪一天搭乘的？」\n"
+                        "- 若使用者沒提到類型，根據趟數自動判斷\n"
+                        "- 所有欄位都確認完畢後才呼叫 submit_form\n"
+                        "- 日期格式必須是 YYYY-MM-DD\n"
+                        "- rideType 必須是 01_單日單趟、02_單日來回、03_單日多趟(請於備註說明) 三選一"
                     ),
                     "input_audio_format": "pcm16",
                     "input_audio_transcription": {
                         "model": OPENAI_TRANSCRIBE_MODEL,
                         "language": OPENAI_TRANSCRIBE_LANG,
-                        **({"prompt": OPENAI_TRANSCRIBE_PROMPT} if OPENAI_TRANSCRIBE_PROMPT else {}),
                     },
-                    "turn_detection": {"type": "server_vad"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        # Guardrail modes: disable auto-response so we can check
+                        # transcript before triggering response.create manually
+                        **({"create_response": False} if guardrail_mode else {}),
+                        "threshold": 0.7,
+                        "prefix_padding_ms": 500,
+                        "silence_duration_ms": 800,
+                    },
                     "tools": [SUBMIT_FORM_TOOL],
                     "tool_choice": "auto",
                 },
@@ -601,6 +671,53 @@ async def realtime_proxy(client_ws: WebSocket):
             tool_call_buffers: dict[str, str] = {}
             client_started_at: datetime | None = None
             audio_samples_total = 0
+
+            # ── Guardrail helpers ──
+
+            async def _notify_guardrail(result: GuardrailResult, direction: str) -> None:
+                """Send guardrail result to frontend."""
+                await safe_send({
+                    "type": "guardrail_result",
+                    "passed": result.passed,
+                    "check_type": result.check_type,
+                    "message": result.message,
+                    "direction": direction,
+                })
+
+            async def _run_text_guardrail(text: str, direction: str) -> GuardrailResult:
+                """Run text guardrail, notify frontend, return result."""
+                dir_label = "輸入" if direction == "input" else "輸出"
+                await safe_send({
+                    "type": "guardrail_checking",
+                    "message": f"{dir_label}文字檢查中...",
+                    "direction": direction,
+                })
+                result = await guardrail_check_text(text, direction)
+                await _notify_guardrail(result, direction)
+                return result
+
+            # Mode 1: streaming audio guardrail session
+            audio_guardrail: AudioGuardrailSession | None = None
+            if guardrail_mode == "pre_check":
+                async def _on_audio_guardrail_result(result: GuardrailResult):
+                    direction = "input" if "input" in result.check_type else "output"
+                    await _notify_guardrail(result, direction)
+                    if not result.passed:
+                        await safe_send({
+                            "type": "guardrail_result",
+                            "passed": False,
+                            "check_type": result.check_type,
+                            "message": result.message,
+                            "direction": direction,
+                        })
+
+                audio_guardrail = AudioGuardrailSession(on_result=_on_audio_guardrail_result)
+                connected = await audio_guardrail.connect()
+                if connected:
+                    print("[guardrail] Audio guardrail WS connected (dual-stream)")
+                else:
+                    print("[guardrail] Audio guardrail WS failed, falling back to text-only")
+                    audio_guardrail = None
 
             async def receive_from_client():
                 nonlocal client_started_at, audio_samples_total
@@ -614,6 +731,11 @@ async def realtime_proxy(client_ws: WebSocket):
                                 audio_samples_total += len(audio_bytes) // 2
                             except (ValueError, TypeError):
                                 pass
+
+                            # Mode 1: stream audio to guardrail server in real-time
+                            if audio_guardrail:
+                                await audio_guardrail.send_audio(message["audio"], "input")
+
                             await ws_send(
                                 openai_ws,
                                 {"type": "input_audio_buffer.append", "audio": message["audio"]},
@@ -628,6 +750,12 @@ async def realtime_proxy(client_ws: WebSocket):
                                 except ValueError:
                                     client_started_at = None
                         elif "text" in message:
+                            # Text guardrail (both modes)
+                            if guardrail_mode:
+                                result = await _run_text_guardrail(message["text"], "input")
+                                if not result.passed:
+                                    continue
+
                             await ws_send(
                                 openai_ws,
                                 {
@@ -653,6 +781,58 @@ async def realtime_proxy(client_ws: WebSocket):
                         event_type = event.get("type")
                         logger.log_in(event)
                         logger.on_event(event)
+
+                        # ── Mode 1: stream AI output audio to guardrail server ──
+                        if (
+                            audio_guardrail
+                            and event_type == "response.audio.delta"
+                        ):
+                            delta = event.get("delta", "")
+                            if delta:
+                                await audio_guardrail.send_audio(delta, "output")
+
+                        # ── Guardrail: check user transcript, then trigger response ──
+                        # With create_response=false, we must manually send
+                        # response.create after guardrail passes.
+                        if (
+                            guardrail_mode
+                            and event_type == "conversation.item.input_audio_transcription.completed"
+                        ):
+                            transcript = event.get("transcript", "")
+                            print(f"[guardrail] transcript: \"{transcript}\"")
+                            if transcript.strip():
+                                # Mode 2: text guardrail on transcript
+                                if guardrail_mode == "post_check":
+                                    result = await _run_text_guardrail(transcript, "input")
+                                    print(f"[guardrail] result: passed={result.passed} msg={result.message}")
+                                    if not result.passed:
+                                        await safe_send({
+                                            "type": "user_done",
+                                            "content": f"[已攔截] {transcript}",
+                                        })
+                                        await forward_debug_event(event, safe_send)
+                                        continue
+                            # Guardrail passed (or Mode 1 audio-only) → trigger AI response
+                            await ws_send(openai_ws, {"type": "response.create"}, logger)
+
+                        # ── Output text guardrail (both modes) ──
+                        if (
+                            guardrail_mode in ("pre_check", "post_check")
+                            and event_type == "response.audio_transcript.done"
+                        ):
+                            transcript = event.get("transcript", "")
+                            print(f"[guardrail] Output transcript: \"{transcript[:80]}\"")
+                            if transcript.strip():
+                                result = await _run_text_guardrail(transcript, "output")
+                                print(f"[guardrail] Output result: passed={result.passed} msg={result.message}")
+                                if not result.passed:
+                                    await safe_send(
+                                        {"type": "agent_delta", "content": f"\n[回應已被 Guardrail 攔截: {result.message}]"}
+                                    )
+                                    await safe_send({"type": "agent_done"})
+                                    continue
+
+                        # ── Standard event forwarding ──
                         if event_type == "response.audio.delta":
                             await safe_send({
                                 "type": "audio_delta",
@@ -754,7 +934,11 @@ async def realtime_proxy(client_ws: WebSocket):
                 except Exception as exc:
                     await safe_send({"type": "error", "message": str(exc)})
 
-            await asyncio.gather(receive_from_client(), receive_from_openai())
+            try:
+                await asyncio.gather(receive_from_client(), receive_from_openai())
+            finally:
+                if audio_guardrail:
+                    await audio_guardrail.close()
     except Exception as exc:
         if client_ws.client_state.name == "CONNECTED":
             await client_ws.send_json({"type": "error", "message": str(exc)})
@@ -769,6 +953,8 @@ async def realtime_stt(client_ws: WebSocket):
         await client_ws.close()
         return
 
+    stt_model = client_ws.query_params.get("model", DEFAULT_REALTIME_MODEL)
+
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     if OPENAI_BETA_HEADER:
         headers["OpenAI-Beta"] = OPENAI_BETA_HEADER
@@ -779,7 +965,7 @@ async def realtime_stt(client_ws: WebSocket):
 
     try:
         async with websockets.connect(
-            OPENAI_REALTIME_URL, additional_headers=headers
+            _realtime_url(stt_model), additional_headers=headers
         ) as openai_ws:
             logger = RealtimeTurnLogger("realtime-stt")
 
@@ -799,7 +985,6 @@ async def realtime_stt(client_ws: WebSocket):
                     "input_audio_transcription": {
                         "model": OPENAI_TRANSCRIBE_MODEL,
                         "language": OPENAI_TRANSCRIBE_LANG,
-                        **({"prompt": OPENAI_TRANSCRIBE_PROMPT} if OPENAI_TRANSCRIBE_PROMPT else {}),
                     },
                     "turn_detection": {"type": "server_vad"},
                 },
@@ -968,6 +1153,36 @@ def get_ws_session_events(conn_id: str) -> list[dict]:
 def log_client_error(payload: ClientError) -> dict[str, str]:
     print(f"[client-error:{payload.source}] {payload.message} | detail={payload.detail}")
     return {"status": "ok"}
+
+
+@app.get("/api/guardrail-info")
+def guardrail_info() -> dict:
+    """Return guardrail endpoint info for frontend display."""
+    return {
+        "audio_ws": os.getenv("GUARDRAIL_WS_URL", ""),
+        "text_mode": "Local pattern-based (Prompt injection / PII / Abuse / Fraud detection)",
+        "transcription_model": OPENAI_TRANSCRIBE_MODEL,
+        "realtime_model": DEFAULT_REALTIME_MODEL,
+        "api_key_set": bool(os.getenv("GUARDRAIL_API_KEY", "")),
+    }
+
+
+@app.get("/api/models")
+def list_models() -> dict:
+    """Return available Realtime models with pricing for frontend display."""
+    models = []
+    for model_id, info in REALTIME_MODELS.items():
+        models.append({
+            "id": model_id,
+            "label": info["label"],
+            "pricing": {
+                "text_input_per_1m": round(info["text_input_per_1k"] * 1000, 2),
+                "text_output_per_1m": round(info["text_output_per_1k"] * 1000, 2),
+                "audio_input_per_1m": round(info["audio_input_per_1k"] * 1000, 2),
+                "audio_output_per_1m": round(info["audio_output_per_1k"] * 1000, 2),
+            },
+        })
+    return {"models": models, "default": DEFAULT_REALTIME_MODEL}
 
 
 init_db()
