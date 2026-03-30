@@ -1,133 +1,138 @@
-"""Custom LiteLLM Guardrail: Audio Guardrail WS streaming.
+"""LiteLLM Custom Logger: Audio Guardrail via WebSocket monkey patching.
 
-Wraps the external audio guardrail WebSocket service as a LiteLLM guardrail.
-Registered in litellm_config.yaml and managed through LiteLLM's guardrail interface.
+Based on: https://github.com/DScathay/voice-guardrails (realtime branch)
 
-The audio guardrail streams raw PCM16 audio to an external WS service
-that runs a multimodal model to detect unsafe audio content.
+Intercepts LiteLLM's internal WebSocket to stream user input audio
+to an external guardrail WS server (multimodal model) in real-time.
+
+Technique: async_pre_call_hook receives the WebSocket object from LiteLLM,
+then monkey-patches receive() to intercept input_audio_buffer.append events.
+On UNSAFE result, injects an error event to the frontend.
 
 Protocol:
   → send: raw PCM16 binary bytes (16kHz mono)
   ← recv: {"event": "guardrail_result", "status": "SAFE"|"UNSAFE", "process_time_sec": ...}
 """
 
-from __future__ import annotations
-
+import os
+import json
 import asyncio
 import base64
-import json
-import os
-from typing import Any, Optional
 
 import numpy as np
 import websockets
-from litellm.integrations.custom_guardrail import CustomGuardrail
-from litellm.types.guardrails import GuardrailEventHooks
+from litellm.integrations.custom_logger import CustomLogger
 
 
-SRC_RATE = 24000
-TGT_RATE = 16000
+SRC_RATE = 24000  # OpenAI native sample rate
+TGT_RATE = 16000  # Guardrail server expected sample rate
 
 
-def _resample_pcm16(pcm16_bytes: bytes) -> bytes:
+def _resample(pcm16_bytes: bytes) -> bytes:
     audio = np.frombuffer(pcm16_bytes, dtype=np.int16)
     if len(audio) == 0:
         return b""
     num_samples = int(len(audio) * TGT_RATE / SRC_RATE)
-    resampled = np.interp(
+    return np.interp(
         np.linspace(0, len(audio), num_samples, endpoint=False),
         np.arange(len(audio)),
         audio,
-    ).astype(np.int16)
-    return resampled.tobytes()
+    ).astype(np.int16).tobytes()
 
 
-class AudioGuardrail(CustomGuardrail):
-    """LiteLLM custom guardrail that streams audio to an external WS guardrail service."""
+class AudioGuardrailHook(CustomLogger):
+    """Monkey-patches LiteLLM's realtime WebSocket to stream audio to guardrail server."""
 
-    supported_event_hooks = [
-        GuardrailEventHooks.pre_call,
-        GuardrailEventHooks.during_call,
-    ]
+    def __init__(self):
+        API_KEY = os.getenv("GUARDRAIL_API_KEY", "")
+        BASE_WS_URL = os.getenv("GUARDRAIL_WS_URL", "")
 
-    def __init__(self, ws_url: str = "", api_key: str = "", **kwargs):
-        self.ws_url = ws_url or os.getenv("GUARDRAIL_WS_URL", "")
-        self.api_key = api_key or os.getenv("GUARDRAIL_API_KEY", "")
-        # Active sessions keyed by some session identifier
-        self._sessions: dict[str, dict] = {}
-        super().__init__(**kwargs)
-        print(f"[AudioGuardrail] initialized, ws_url={self.ws_url}")
+        if not BASE_WS_URL:
+            print("[AudioGuardrail] WARNING: GUARDRAIL_WS_URL not set, audio guardrail disabled")
+            self.guardrail_ws_url = ""
+        else:
+            separator = "&" if "?" in BASE_WS_URL else "?"
+            self.guardrail_ws_url = f"{BASE_WS_URL}{separator}api_key={API_KEY}" if API_KEY else BASE_WS_URL
 
-    def _build_url(self) -> str:
-        if not self.ws_url:
-            return ""
-        separator = "&" if "?" in self.ws_url else "?"
-        return f"{self.ws_url}{separator}api_key={self.api_key}" if self.api_key else self.ws_url
+        print(f"[AudioGuardrail] initialized, input-stream guardrail ready")
 
-    async def connect_session(self) -> Optional[dict]:
-        """Create a new audio guardrail streaming session."""
-        url = self._build_url()
-        if not url:
-            print("[AudioGuardrail] no WS URL configured, skipping")
-            return None
-        try:
-            ws = await websockets.connect(url, open_timeout=10)
-            session = {
-                "ws": ws,
-                "closed": False,
-                "results": [],
-                "listen_task": None,
-            }
-            session["listen_task"] = asyncio.create_task(self._listen(session))
-            print("[AudioGuardrail] WS connected")
-            return session
-        except Exception as exc:
-            print(f"[AudioGuardrail] WS connect failed: {exc}")
-            return None
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, **kwargs):
+        """Called by LiteLLM before the realtime WebSocket proxy starts.
 
-    async def send_audio(self, session: dict, pcm16_base64: str) -> None:
-        """Send audio chunk to the guardrail WS."""
-        ws = session.get("ws")
-        if not ws or session.get("closed"):
+        We get the client WebSocket and monkey-patch receive() to intercept
+        input audio and stream it to the guardrail server.
+        """
+        if not self.guardrail_ws_url:
             return
-        try:
-            raw = base64.b64decode(pcm16_base64)
-            resampled = _resample_pcm16(raw)
-            await ws.send(resampled)
-        except Exception:
-            pass
 
-    async def close_session(self, session: dict) -> None:
-        """Close a streaming session."""
-        session["closed"] = True
-        if session.get("listen_task"):
-            session["listen_task"].cancel()
-        ws = session.get("ws")
-        if ws:
+        client_ws = data.get("websocket")
+        if not client_ws:
+            return
+
+        print("[AudioGuardrail] WebSocket intercepted, injecting input audio listener")
+
+        original_receive = client_ws.receive
+        g_ws = None
+
+        async def listen_results(ws):
+            """Listen for guardrail results and inject error events on UNSAFE."""
             try:
-                await ws.close()
-            except Exception:
-                pass
+                while True:
+                    response = await ws.recv()
+                    result = json.loads(
+                        response.decode("utf-8") if isinstance(response, bytes) else response
+                    )
+                    if result.get("event") == "guardrail_result":
+                        status = result.get("status")
+                        process_time = result.get("process_time_sec", 0)
+                        if status == "UNSAFE":
+                            print(f"[AudioGuardrail] UNSAFE detected ({process_time:.2f}s)")
+                            try:
+                                await client_ws.send_text(json.dumps({
+                                    "type": "error",
+                                    "error": {
+                                        "type": "guardrail_violation",
+                                        "code": "audio_guardrail_violation",
+                                        "message": f"輸入音訊不安全 (偵測耗時 {process_time:.2f}s)",
+                                    },
+                                }))
+                            except Exception:
+                                pass
+                        else:
+                            print(f"[AudioGuardrail] SAFE ({process_time:.2f}s)")
+            except Exception as e:
+                print(f"[AudioGuardrail] listener stopped: {e}")
 
-    def get_latest_result(self, session: dict) -> Optional[dict]:
-        """Get the most recent guardrail result from the session."""
-        results = session.get("results", [])
-        return results[-1] if results else None
+        async def patched_receive():
+            nonlocal g_ws
+            msg = await original_receive()
 
-    async def _listen(self, session: dict) -> None:
-        ws = session["ws"]
-        try:
-            async for msg in ws:
-                try:
-                    text = msg.decode("utf-8") if isinstance(msg, bytes) else msg
-                    data = json.loads(text)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
+            try:
+                if msg.get("type") == "websocket.receive" and msg.get("text"):
+                    payload = json.loads(msg["text"])
+                    if payload.get("type") == "input_audio_buffer.append":
+                        audio_b64 = payload.get("audio")
+                        if audio_b64:
+                            resampled = _resample(base64.b64decode(audio_b64))
 
-                if data.get("event") == "guardrail_result":
-                    session["results"].append(data)
+                            # Connect to guardrail WS if needed
+                            is_open = False
+                            if g_ws:
+                                is_open = not getattr(g_ws, "closed", True)
+                            if g_ws is None or not is_open:
+                                g_ws = await websockets.connect(self.guardrail_ws_url)
+                                asyncio.create_task(listen_results(g_ws))
+                                print("[AudioGuardrail] WS connected")
 
-        except (websockets.ConnectionClosed, asyncio.CancelledError):
-            pass
-        except Exception as exc:
-            print(f"[AudioGuardrail] listen error: {exc}")
+                            await g_ws.send(resampled)
+            except Exception as e:
+                print(f"[AudioGuardrail] intercept error: {e}")
+
+            return msg
+
+        client_ws.receive = patched_receive
+        print("[AudioGuardrail] monkey patch applied")
+
+
+# LiteLLM loads this instance via callbacks config
+audio_guardrail_instance = AudioGuardrailHook()
