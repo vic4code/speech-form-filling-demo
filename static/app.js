@@ -99,13 +99,17 @@ const updateGuardrailInfo = () => {
   }
   fetch("/api/guardrail-info").then(r => r.json()).then(info => {
     const mode = guardrailModeSelect.value;
+    const textTarget = info.bedrock_guardrail_id
+      ? `LiteLLM → Bedrock (${info.bedrock_guardrail_id})`
+      : "未設定";
     const lines = [];
     if (mode === "pre_check") {
       lines.push(`<b>Input:</b> Audio → ${info.audio_ws || "(未設定)"}`);
+      lines.push(`<b>Input (text):</b> Transcript → ${textTarget}`);
     } else {
-      lines.push(`<b>Input:</b> Transcript → Local pattern check`);
+      lines.push(`<b>Input:</b> Transcript → ${textTarget}`);
     }
-    lines.push(`<b>Output:</b> Agent transcript → Local pattern check`);
+    lines.push(`<b>Output:</b> Agent transcript → ${textTarget}`);
     guardrailInfoEl.innerHTML = lines.join("&nbsp;&nbsp;|&nbsp;&nbsp;");
     guardrailInfoEl.style.display = "block";
   }).catch(() => { guardrailInfoEl.style.display = "none"; });
@@ -346,22 +350,23 @@ sttReview.addEventListener("click", () => {
 });
 
 const startSttAudio = async () => {
-  sttStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  sttStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      sampleRate: 24000,
+      echoCancellation: true,
+      noiseSuppression: true,
+    },
+  });
   sttAudioContext = new AudioContext({ sampleRate: 24000 });
+  await sttAudioContext.audioWorklet.addModule("/static/audio-processor.js");
   const source = sttAudioContext.createMediaStreamSource(sttStream);
-  sttAudioProcessor = sttAudioContext.createScriptProcessor(4096, 1, 1);
-  sttAudioProcessor.onaudioprocess = (event) => {
-    if (!sttSocket || sttSocket.readyState !== WebSocket.OPEN) {
-      return;
-    }
-    const inputData = event.inputBuffer.getChannelData(0);
-    const pcmData = new Int16Array(inputData.length);
-    for (let i = 0; i < inputData.length; i += 1) {
-      const sample = Math.max(-1, Math.min(1, inputData[i]));
-      pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-    }
-    sttAudioSamplesTotal += pcmData.length;
-    const base64Audio = arrayBufferToBase64(pcmData.buffer);
+  sttAudioProcessor = new AudioWorkletNode(sttAudioContext, "pcm-processor");
+  sttAudioProcessor.port.onmessage = (event) => {
+    if (!sttSocket || sttSocket.readyState !== WebSocket.OPEN) return;
+    const pcmBuffer = event.data;
+    sttAudioSamplesTotal += pcmBuffer.byteLength / 2;
+    const base64Audio = arrayBufferToBase64(pcmBuffer);
     sttSocket.send(JSON.stringify({ audio: base64Audio }));
   };
   source.connect(sttAudioProcessor);
@@ -490,21 +495,22 @@ const arrayBufferToBase64 = (buffer) => {
 };
 
 const startConversationAudio = async () => {
-  conversationStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  conversationStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      sampleRate: 24000,
+      echoCancellation: true,
+      noiseSuppression: true,
+    },
+  });
   conversationAudioContext = new AudioContext({ sampleRate: 24000 });
+  await conversationAudioContext.audioWorklet.addModule("/static/audio-processor.js");
   const source = conversationAudioContext.createMediaStreamSource(conversationStream);
-  conversationAudioProcessor = conversationAudioContext.createScriptProcessor(4096, 1, 1);
-  conversationAudioProcessor.onaudioprocess = (event) => {
-    if (!conversationSocket || conversationSocket.readyState !== WebSocket.OPEN) {
-      return;
-    }
-    const inputData = event.inputBuffer.getChannelData(0);
-    const pcmData = new Int16Array(inputData.length);
-    for (let i = 0; i < inputData.length; i += 1) {
-      const sample = Math.max(-1, Math.min(1, inputData[i]));
-      pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-    }
-    const base64Audio = arrayBufferToBase64(pcmData.buffer);
+  conversationAudioProcessor = new AudioWorkletNode(conversationAudioContext, "pcm-processor");
+  conversationAudioProcessor.port.onmessage = (event) => {
+    if (!conversationSocket || conversationSocket.readyState !== WebSocket.OPEN) return;
+    const pcmBuffer = event.data;
+    const base64Audio = arrayBufferToBase64(pcmBuffer);
     conversationSocket.send(JSON.stringify({ audio: base64Audio }));
   };
   source.connect(conversationAudioProcessor);
@@ -597,30 +603,30 @@ const startConversationRealtime = async () => {
       conversationSubmittedPayload = data.payload || null;
       conversationPendingMeta = data.meta || null;
       structuredOutput.value = JSON.stringify(conversationSubmittedPayload || {}, null, 2);
-      structuredOutput.hidden = false;
+      // structuredOutput is always visible now
       conversationStatus.textContent = "表單已完成，請確認後送出。";
       populateConversationForm(conversationSubmittedPayload);
       stopConversationRealtime();
+    } else if (data.type === "playback_stop") {
+      // Server says user interrupted — stop audio immediately
+      stopPlayback();
     } else if (data.type === "audio_delta") {
       console.log("[audio] ← audio_delta received, base64 length:", data.delta?.length, "ctx state:", conversationAudioPlayCtx?.state);
       playAudioDelta(data.delta);
+    } else if (data.type === "guardrail_chat") {
+      // Show guardrail result directly in the conversation area
+      const cssRole = data.passed ? "guardrail-pass" : "guardrail";
+      conversationMessages.push({ role: cssRole, content: data.message });
+      renderChat();
     } else if (data.type === "guardrail_result") {
-      const dir = data.direction === "output" ? "Output" : "Input";
-      const dirLabel = data.direction === "output" ? "輸出" : "輸入";
-      if (data.passed) {
-        showGuardrailStatus("safe", `✓ ${dir} Guardrail: ${data.message || "通過"}`);
-      } else {
-        // BLOCKED: show popup + chat message + stop conversation
+      // Only handle blocked results (passed results are shown via guardrail_chat)
+      if (!data.passed) {
+        const dirLabel = data.direction === "output" ? "輸出" : "輸入";
         const blockMsg = data.message || "此內容違反安全規範";
-        showGuardrailStatus("blocked", `✗ ${dir} Guardrail: ${blockMsg}`);
         showGuardrailWarning(`${dirLabel}安全防護：${blockMsg}`);
-        addGuardrailChatMessage(`BLOCKED: ${blockMsg}`);
-        // Stop the conversation
-        stopConversationRealtime();
       }
     } else if (data.type === "guardrail_checking") {
-      const dir = data.direction === "output" ? "Output" : "Input";
-      showGuardrailStatus("checking", `⋯ ${dir} Guardrail ${data.message || "檢查中..."}`);
+      // No top-bar display; checking status is shown in chat via guardrail_chat
     } else if (data.type === "session_event") {
       appendSessionEvent(data);
     } else if (data.type === "debug_event") {
@@ -687,6 +693,15 @@ const playAudioDelta = async (base64) => {
   console.log(`[audio] scheduling chunk: samples=${float32.length}, dur=${buffer.duration.toFixed(3)}s, schedAt=${conversationNextPlayTime.toFixed(3)}, ctxNow=${now.toFixed(3)}`);
   source.start(conversationNextPlayTime);
   conversationNextPlayTime += buffer.duration;
+};
+
+const stopPlayback = () => {
+  // Stop audio playback without closing the WebSocket connection
+  if (conversationAudioPlayCtx && conversationAudioPlayCtx.state !== "closed") {
+    conversationAudioPlayCtx.close();
+    conversationAudioPlayCtx = new AudioContext({ sampleRate: 24000 });
+    conversationNextPlayTime = conversationAudioPlayCtx.currentTime;
+  }
 };
 
 const stopConversationRealtime = () => {
@@ -1002,7 +1017,13 @@ const submitRequest = async (mode, payload, statusEl) => {
     const response = await fetch("/api/requests", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode, payload, meta, connId: _wsConnId }),
+      body: JSON.stringify({
+        mode,
+        payload,
+        meta,
+        connId: _wsConnId,
+        guardrailMode: guardrailEnabled.checked ? guardrailModeSelect.value : null,
+      }),
     });
     if (!response.ok) {
       throw new Error("提交失敗");

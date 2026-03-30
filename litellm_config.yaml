@@ -1,12 +1,41 @@
 model_list:
-  - model_name: gpt-4o-mini
+  - model_name: openai/gpt-4o-realtime-preview-2024-12-17
+    litellm_params:
+      model: openai/gpt-4o-realtime-preview-2024-12-17
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: openai/gpt-4o-realtime-preview-2024-10-01
+    litellm_params:
+      model: openai/gpt-4o-realtime-preview-2024-10-01
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: openai/gpt-4o-mini-realtime-preview-2024-12-17
+    litellm_params:
+      model: openai/gpt-4o-mini-realtime-preview-2024-12-17
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Text model for guardrail pre_call checks
+  - model_name: openai/gpt-4o-mini
     litellm_params:
       model: openai/gpt-4o-mini
       api_key: os.environ/OPENAI_API_KEY
 
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
 guardrails:
-  - guardrail_name: my-guardrail
+  # ── Text Guardrail: Bedrock endpoint ──
+  - guardrail_name: bedrock-text-guardrail
     litellm_params:
-      guardrail: aporia  # 可替換為你自己的 guardrail provider
-      mode: [pre_call, post_call]
+      guardrail: bedrock
+      guardrailIdentifier: os.environ/BEDROCK_GUARDRAIL_ID
+      guardrailVersion: os.environ/BEDROCK_GUARDRAIL_VERSION
+      mode: pre_call
+      default_on: true
+
+  # ── Audio Guardrail: WS streaming endpoint ──
+  - guardrail_name: audio-ws-guardrail
+    litellm_params:
+      guardrail: audio_guardrail.AudioGuardrail
+      mode: during_call
       default_on: true

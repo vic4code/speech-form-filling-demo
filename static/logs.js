@@ -26,11 +26,18 @@ const updateSummary = (items) => {
   }
 };
 
+const logGuardrail = document.getElementById("log-guardrail");
+
 const getFiltered = () => {
   const term = logSearch.value.trim().toLowerCase();
   const mode = logMode.value;
+  const grFilter = logGuardrail.value;
   return allSessions.filter((s) => {
     if (mode !== "all" && s.req_mode !== mode) return false;
+    if (grFilter !== "all") {
+      if (grFilter === "off" && s.guardrail_mode) return false;
+      if (grFilter !== "off" && s.guardrail_mode !== grFilter) return false;
+    }
     if (!term) return true;
     const searchable = [
       s.session_id || "",
@@ -63,22 +70,29 @@ const renderSessions = (items) => {
     const modeBadge = s.req_mode
       ? `<span class="badge">${s.req_mode.toUpperCase()}</span>`
       : "";
-    const costMeta = s.req_cost != null
-      ? `<span class="log-metric cost">Cost: ${formatCost(s.req_cost)}</span>`
-      : "";
-    const timeMeta = s.user_duration_ms
-      ? `<span class="log-metric time">Time: ${formatDuration(s.user_duration_ms)}</span>`
-      : "";
+    const grModeLabels = {
+      pre_check: "Audio + Text Guardrail",
+      post_check: "Text Guardrail",
+    };
+    const grMode = s.guardrail_mode;
+    const grBadge = grMode
+      ? `<span class="badge guardrail-badge">${grModeLabels[grMode] || grMode}</span>`
+      : `<span class="badge badge-muted">Guardrail OFF</span>`;
+
+    const textIn = s.token_usage?.input || 0;
+    const textOut = s.token_usage?.output || 0;
+    const audioIn = s.audio_input_tokens || 0;
+    const audioOut = s.audio_output_tokens || 0;
+    const totalTokens = textIn + textOut + audioIn + audioOut;
+    const costMeta = `<span class="log-metric cost">Cost: ${formatCost(s.req_cost || 0)}</span>`;
+    const timeMeta = `<span class="log-metric time">Time: ${formatDuration(s.user_duration_ms)}</span>`;
     const eventsMeta = s.event_count
       ? `<span class="log-metric">${s.event_count} events</span>`
       : "";
-    const tokenMeta = s.token_usage && (s.token_usage.input || s.token_usage.output)
-      ? `<span class="log-metric">In: ${s.token_usage.input}</span>
-         <span class="log-metric">Out: ${s.token_usage.output}</span>`
-      : "";
+    const tokenMeta = `<span class="log-metric">Tokens: ${totalTokens} (Text ${textIn}+${textOut} / Audio ${audioIn}+${audioOut})</span>`;
 
     const deleteBtn = s.req_id
-      ? `<button class="button secondary log-delete" data-id="${s.req_id}">刪除</button>`
+      ? `<button class="log-delete-btn" data-id="${s.req_id}" title="刪除此筆紀錄">✕</button>`
       : "";
 
     const payloadSection = s.req_payload
@@ -97,14 +111,14 @@ const renderSessions = (items) => {
 
     el.innerHTML = `
       <div class="log-header">
-        <div class="log-id">${headerId}</div>
-        <span class="log-time">${headerTs}</span>
-      </div>
-      <div class="log-actions">
-        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
-          ${endpointBadge}${modeBadge}
+        <div class="log-header-left">
+          <div class="log-id">${headerId}</div>
+          <span class="log-time">${headerTs}</span>
         </div>
-        <div class="log-actions-buttons">${deleteBtn}</div>
+        ${deleteBtn}
+      </div>
+      <div class="log-badges">
+        ${endpointBadge}${modeBadge}${grBadge}
       </div>
       <div class="log-meta">
         ${eventsMeta}${tokenMeta}${costMeta}${timeMeta}
@@ -163,13 +177,26 @@ const refreshView = () => {
   renderSessions(filtered);
 };
 
+const logDeleteAll = document.getElementById("log-delete-all");
+
 logSearch.addEventListener("input", refreshView);
 logMode.addEventListener("change", refreshView);
+logGuardrail.addEventListener("change", refreshView);
 logRefresh.addEventListener("click", loadSessions);
+logDeleteAll.addEventListener("click", async () => {
+  if (!window.confirm("確定要刪除所有紀錄嗎？此操作無法復原。")) return;
+  try {
+    const res = await fetch("/api/requests", { method: "DELETE" });
+    if (!res.ok) throw new Error("delete all failed");
+    await loadSessions();
+  } catch {
+    alert("刪除失敗，請稍後再試。");
+  }
+});
 
 logsContainer.addEventListener("click", async (event) => {
   const target = event.target;
-  if (!(target instanceof HTMLElement) || !target.classList.contains("log-delete")) return;
+  if (!(target instanceof HTMLElement) || !target.classList.contains("log-delete-btn")) return;
   const requestId = target.dataset.id;
   if (!requestId || !window.confirm("確定要刪除這筆紀錄嗎？")) return;
   try {
