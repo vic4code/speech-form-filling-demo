@@ -1,15 +1,9 @@
-"""Guardrail integration — all guardrails go through LiteLLM.
+"""Guardrail types — all guardrails are fully managed by LiteLLM.
 
-Text Guardrail:
-  - LiteLLM → litellm_content_filter (realtime_input_transcription hook)
-  - LiteLLM → Bedrock Guardrail (pre_call)
+Text Guardrail: LiteLLM → Bedrock Guardrail (pre_call hook in guardrails config)
+Audio Guardrail: LiteLLM → AudioGuardrailHook (monkey patch via callbacks config)
 
-Audio Guardrail:
-  - LiteLLM → custom AudioGuardrail (audio_guardrail.py)
-  - FastAPI manages the streaming session via LiteLLM's guardrail instance
-
-All guardrail endpoints are registered and managed through LiteLLM's
-guardrail interface in litellm_config.yaml.
+FastAPI does not interact with any guardrail endpoint directly.
 """
 
 from __future__ import annotations
@@ -24,16 +18,3 @@ class GuardrailResult:
     check_type: str  # "input_audio" | "input_text" | "output_text"
     message: str = ""
     detail: dict[str, Any] = field(default_factory=dict)
-
-
-def get_audio_guardrail():
-    """Get the LiteLLM-registered AudioGuardrail instance."""
-    try:
-        import litellm
-        for cb in litellm.logging_callback_manager.callbacks:
-            cls_name = type(cb).__name__
-            if cls_name == "AudioGuardrail":
-                return cb
-    except Exception as exc:
-        print(f"[guardrail] Failed to get AudioGuardrail from LiteLLM: {exc}")
-    return None
