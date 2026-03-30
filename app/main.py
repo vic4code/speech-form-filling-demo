@@ -5,7 +5,6 @@ import os
 import sqlite3
 import asyncio
 import base64
-import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,12 +20,9 @@ from starlette.websockets import WebSocketDisconnect
 from dotenv import load_dotenv
 import websockets
 
-from app.guardrails import (
-    check_text as guardrail_check_text,
-    AudioGuardrailSession,
-    GuardrailResult,
-    is_configured as guardrail_is_configured,
-)
+import httpx
+
+from app.guardrails import GuardrailResult, get_audio_guardrail
 
 
 load_dotenv()
@@ -67,9 +63,12 @@ def _get_model_pricing(model: str) -> dict:
 
 
 def _realtime_url(model: str) -> str:
-    """Build the OpenAI Realtime WebSocket URL for a given model."""
-    base = os.getenv("OPENAI_REALTIME_BASE_URL", "wss://api.openai.com/v1/realtime")
-    return f"{base}?model={model}"
+    """Build the LiteLLM proxy Realtime WebSocket URL for a given model."""
+    base = os.getenv("LITELLM_PROXY_URL", "ws://localhost:4000")
+    return f"{base}/v1/realtime?model=openai/{model}"
+
+
+LITELLM_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "")
 
 
 # Derive legacy cost constants from default model for backward compat
@@ -78,10 +77,9 @@ COST_PER_1K_INPUT = _default_pricing["text_input_per_1k"]
 COST_PER_1K_OUTPUT = _default_pricing["text_output_per_1k"]
 AUDIO_COST_PER_1K_INPUT = _default_pricing["audio_input_per_1k"]
 AUDIO_COST_PER_1K_OUTPUT = _default_pricing["audio_output_per_1k"]
-AUDIO_TOKENS_PER_SECOND = float(os.getenv("AUDIO_TOKENS_PER_SECOND", "50"))
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_BETA_HEADER = os.getenv("OPENAI_BETA_HEADER", "realtime=v1")
+
+# OpenAI API key is now managed by LiteLLM proxy (config.yaml)
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
 def normalize_transcribe_lang(raw: str) -> str:
     """Normalize locale-like tags to supported base language codes."""
@@ -96,6 +94,48 @@ OPENAI_TRANSCRIBE_LANG = normalize_transcribe_lang(
     os.getenv("OPENAI_TRANSCRIBE_LANG", "zh")
 )
 OPENAI_TRANSCRIBE_PROMPT = os.getenv("OPENAI_TRANSCRIBE_PROMPT", "").strip()
+
+
+def _is_prompt_leak(transcript: str) -> bool:
+    """Detect if gpt-4o-transcribe echoed the prompt back as a transcript."""
+    if not OPENAI_TRANSCRIBE_PROMPT or not transcript:
+        return False
+    t = transcript.strip().replace(" ", "")
+    p = OPENAI_TRANSCRIBE_PROMPT.strip().replace(" ", "")
+    # Check if transcript is mostly the prompt (>60% overlap)
+    if len(t) < 5:
+        return False
+    return t in p or p in t or (len(set(t) & set(p)) / len(set(t)) > 0.8 and len(t) > 20)
+
+
+async def _check_text_via_litellm(text: str) -> tuple[bool, str]:
+    """Check text via LiteLLM → Bedrock guardrail (pre_call).
+
+    Calls LiteLLM's /chat/completions with a dummy request.
+    If Bedrock guardrail blocks, LiteLLM returns 400.
+    Returns (passed, reason).
+    """
+    litellm_url = os.getenv("LITELLM_PROXY_URL", "ws://localhost:4000").replace("ws://", "http://").replace("wss://", "https://")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{litellm_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"},
+                json={
+                    "model": "openai/gpt-4o-mini",
+                    "messages": [{"role": "user", "content": text}],
+                    "max_tokens": 1,
+                },
+            )
+            if resp.status_code == 200:
+                return True, ""
+            # Guardrail blocked
+            err = resp.json().get("error", {})
+            return False, err.get("message", "違反安全規範")
+    except Exception as exc:
+        print(f"[guardrail] LiteLLM check failed: {exc}")
+        # Fail open — allow if LiteLLM is down
+        return True, ""
 
 
 class TokenUsage(BaseModel):
@@ -122,6 +162,7 @@ class RequestPayload(BaseModel):
     payload: dict[str, Any]
     meta: RequestMeta | None = None
     connId: str | None = None
+    guardrailMode: str | None = None  # "pre_check" | "post_check" | None
 
 
 class RequestRecord(BaseModel):
@@ -134,6 +175,7 @@ class RequestRecord(BaseModel):
     userDurationMs: int
     audioInputTokens: int
     audioOutputTokens: int
+    guardrailMode: str | None = None
     createdAt: str
 
 
@@ -194,6 +236,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE requests ADD COLUMN audio_output_tokens INTEGER NOT NULL DEFAULT 0")
         if "conn_id" not in columns:
             conn.execute("ALTER TABLE requests ADD COLUMN conn_id TEXT")
+        if "guardrail_mode" not in columns:
+            conn.execute("ALTER TABLE requests ADD COLUMN guardrail_mode TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_requests_conn ON requests (conn_id)"
         )
@@ -507,6 +551,7 @@ def create_request(payload: RequestPayload) -> RequestRecord:
         userDurationMs=user_duration_ms,
         audioInputTokens=audio_input_tokens,
         audioOutputTokens=audio_output_tokens,
+        guardrailMode=payload.guardrailMode,
         createdAt=now_iso(),
     )
 
@@ -516,9 +561,9 @@ def create_request(payload: RequestPayload) -> RequestRecord:
             INSERT INTO requests (
                 id, mode, payload_json, token_usage_json, cost, processing_ms,
                 user_duration_ms, audio_input_tokens, audio_output_tokens, created_at,
-                conn_id
+                conn_id, guardrail_mode
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -532,6 +577,7 @@ def create_request(payload: RequestPayload) -> RequestRecord:
                 record.audioOutputTokens,
                 record.createdAt,
                 payload.connId,
+                payload.guardrailMode,
             ),
         )
     return record
@@ -599,18 +645,16 @@ SUBMIT_FORM_TOOL = {
 @app.websocket("/ws/realtime")
 async def realtime_proxy(client_ws: WebSocket):
     await client_ws.accept()
-    if not OPENAI_API_KEY:
-        await client_ws.send_json({"type": "error", "message": "缺少 OPENAI_API_KEY"})
+    if not LITELLM_MASTER_KEY:
+        await client_ws.send_json({"type": "error", "message": "缺少 LITELLM_MASTER_KEY"})
         await client_ws.close()
         return
 
-    # Parse query params: ?guardrail=pre_check|post_check&model=gpt-4o-realtime-preview-2024-12-17
+    # Parse query params
     guardrail_mode = client_ws.query_params.get("guardrail")
     selected_model = client_ws.query_params.get("model", DEFAULT_REALTIME_MODEL)
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    if OPENAI_BETA_HEADER:
-        headers["OpenAI-Beta"] = OPENAI_BETA_HEADER
+    headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}"}
 
     try:
         async with websockets.connect(
@@ -636,15 +680,19 @@ async def realtime_proxy(client_ws: WebSocket):
                     "output_audio_format": "pcm16",
                     "instructions": (
                         "你是計程車費報銷表單助理。請用繁體中文對話引導使用者完成表單。\n"
-                        "必填欄位：\n"
-                        "1. 乘坐日期（必須問清楚具體日期，格式 YYYY-MM-DD）\n"
-                        "2. 乘坐類型（根據趟數判斷：單趟=01_單日單趟，來回=02_單日來回，多趟=03_單日多趟）\n"
-                        "3. 每趟的起點、迄點、費用、事由\n"
-                        "4. 車資合計\n"
-                        "規則：\n"
-                        "- 若使用者沒提到日期，務必追問「請問是哪一天搭乘的？」\n"
-                        "- 若使用者沒提到類型，根據趟數自動判斷\n"
-                        "- 所有欄位都確認完畢後才呼叫 submit_form\n"
+                        "回覆請簡短扼要，每次回覆不超過兩句話。\n\n"
+                        "必填欄位（缺一不可，全部確認才能送出）：\n"
+                        "1. 乘坐日期（格式 YYYY-MM-DD，必須問清楚具體日期）\n"
+                        "2. 乘坐類型（單趟=01_單日單趟，來回=02_單日來回，多趟=03_單日多趟）\n"
+                        "3. 每趟的起點、迄點、費用、事由（全部都要有值）\n"
+                        "4. 車資合計\n\n"
+                        "重要規則：\n"
+                        "- 絕對不可以在資訊不完整時呼叫 submit_form\n"
+                        "- 逐一確認每個欄位，缺少的欄位務必追問\n"
+                        "- 若使用者沒提到日期，追問「請問是哪一天搭乘的？」\n"
+                        "- 若使用者沒提到費用，追問「這趟費用是多少？」\n"
+                        "- 若使用者沒提到事由，追問「搭乘的事由是什麼？」\n"
+                        "- 所有欄位都確認完畢、使用者也同意後，才呼叫 submit_form\n"
                         "- 日期格式必須是 YYYY-MM-DD\n"
                         "- rideType 必須是 01_單日單趟、02_單日來回、03_單日多趟(請於備註說明) 三選一"
                     ),
@@ -652,15 +700,16 @@ async def realtime_proxy(client_ws: WebSocket):
                     "input_audio_transcription": {
                         "model": OPENAI_TRANSCRIBE_MODEL,
                         "language": OPENAI_TRANSCRIBE_LANG,
+                        **({"prompt": OPENAI_TRANSCRIBE_PROMPT} if OPENAI_TRANSCRIBE_PROMPT else {}),
                     },
                     "turn_detection": {
                         "type": "server_vad",
-                        # Guardrail modes: disable auto-response so we can check
-                        # transcript before triggering response.create manually
-                        **({"create_response": False} if guardrail_mode else {}),
-                        "threshold": 0.7,
-                        "prefix_padding_ms": 500,
-                        "silence_duration_ms": 800,
+                        # Always disable auto-response so we can run text guardrail
+                        # on user transcript before triggering response.create
+                        "create_response": False,
+                        "threshold": 0.85,
+                        "prefix_padding_ms": 400,
+                        "silence_duration_ms": 1000,
                     },
                     "tools": [SUBMIT_FORM_TOOL],
                     "tool_choice": "auto",
@@ -671,53 +720,26 @@ async def realtime_proxy(client_ws: WebSocket):
             tool_call_buffers: dict[str, str] = {}
             client_started_at: datetime | None = None
             audio_samples_total = 0
+            _response_active = False
+            _audio_gr_input_shown = False
+            # Accumulate real usage from response.done events
+            _total_input_tokens = 0
+            _total_output_tokens = 0
+            _total_audio_input_tokens = 0
+            _total_audio_output_tokens = 0
 
-            # ── Guardrail helpers ──
-
-            async def _notify_guardrail(result: GuardrailResult, direction: str) -> None:
-                """Send guardrail result to frontend."""
-                await safe_send({
-                    "type": "guardrail_result",
-                    "passed": result.passed,
-                    "check_type": result.check_type,
-                    "message": result.message,
-                    "direction": direction,
-                })
-
-            async def _run_text_guardrail(text: str, direction: str) -> GuardrailResult:
-                """Run text guardrail, notify frontend, return result."""
-                dir_label = "輸入" if direction == "input" else "輸出"
-                await safe_send({
-                    "type": "guardrail_checking",
-                    "message": f"{dir_label}文字檢查中...",
-                    "direction": direction,
-                })
-                result = await guardrail_check_text(text, direction)
-                await _notify_guardrail(result, direction)
-                return result
-
-            # Mode 1: streaming audio guardrail session
-            audio_guardrail: AudioGuardrailSession | None = None
+            # ── Audio guardrail via LiteLLM (Mode 1 only) ──
+            audio_gr_session = None
             if guardrail_mode == "pre_check":
-                async def _on_audio_guardrail_result(result: GuardrailResult):
-                    direction = "input" if "input" in result.check_type else "output"
-                    await _notify_guardrail(result, direction)
-                    if not result.passed:
-                        await safe_send({
-                            "type": "guardrail_result",
-                            "passed": False,
-                            "check_type": result.check_type,
-                            "message": result.message,
-                            "direction": direction,
-                        })
-
-                audio_guardrail = AudioGuardrailSession(on_result=_on_audio_guardrail_result)
-                connected = await audio_guardrail.connect()
-                if connected:
-                    print("[guardrail] Audio guardrail WS connected (dual-stream)")
+                audio_gr = get_audio_guardrail()
+                if audio_gr:
+                    audio_gr_session = await audio_gr.connect_session()
+                    if audio_gr_session:
+                        print("[guardrail] Audio guardrail WS connected (via LiteLLM)")
+                    else:
+                        print("[guardrail] Audio guardrail WS failed")
                 else:
-                    print("[guardrail] Audio guardrail WS failed, falling back to text-only")
-                    audio_guardrail = None
+                    print("[guardrail] AudioGuardrail not registered in LiteLLM")
 
             async def receive_from_client():
                 nonlocal client_started_at, audio_samples_total
@@ -733,8 +755,25 @@ async def realtime_proxy(client_ws: WebSocket):
                                 pass
 
                             # Mode 1: stream audio to guardrail server in real-time
-                            if audio_guardrail:
-                                await audio_guardrail.send_audio(message["audio"], "input")
+                            if audio_gr_session and audio_gr:
+                                await audio_gr.send_audio(audio_gr_session, message["audio"])
+                                # Check for new results
+                                latest = audio_gr.get_latest_result(audio_gr_session)
+                                if latest and latest.get("status") == "UNSAFE" and not audio_gr_session.get("_notified_unsafe"):
+                                    audio_gr_session["_notified_unsafe"] = True
+                                    process_time = latest.get("process_time_sec", 0)
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": False,
+                                        "message": f"✗ [使用者輸入] 已攔截（Audio Guardrail via LiteLLM）\n　原因：輸入音訊不安全 (偵測耗時 {process_time:.2f}s)",
+                                    })
+                                elif latest and latest.get("status") == "SAFE" and not _audio_gr_input_shown:
+                                    _audio_gr_input_shown = True
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": True,
+                                        "message": "✓ [使用者輸入] 音訊安全檢查通過（Audio Guardrail via LiteLLM）",
+                                    })
 
                             await ws_send(
                                 openai_ws,
@@ -750,12 +789,7 @@ async def realtime_proxy(client_ws: WebSocket):
                                 except ValueError:
                                     client_started_at = None
                         elif "text" in message:
-                            # Text guardrail (both modes)
-                            if guardrail_mode:
-                                result = await _run_text_guardrail(message["text"], "input")
-                                if not result.passed:
-                                    continue
-
+                            # Text input — LiteLLM handles guardrail check
                             await ws_send(
                                 openai_ws,
                                 {
@@ -775,6 +809,8 @@ async def realtime_proxy(client_ws: WebSocket):
                     await safe_send({"type": "error", "message": str(exc)})
 
             async def receive_from_openai():
+                nonlocal _response_active, _total_input_tokens, _total_output_tokens
+                nonlocal _total_audio_input_tokens, _total_audio_output_tokens
                 try:
                     async for raw in openai_ws:
                         event = json.loads(raw)
@@ -782,55 +818,47 @@ async def realtime_proxy(client_ws: WebSocket):
                         logger.log_in(event)
                         logger.on_event(event)
 
-                        # ── Mode 1: stream AI output audio to guardrail server ──
-                        if (
-                            audio_guardrail
-                            and event_type == "response.audio.delta"
-                        ):
-                            delta = event.get("delta", "")
-                            if delta:
-                                await audio_guardrail.send_audio(delta, "output")
+                        # ── VAD interruption: user started speaking → cancel AI response ──
+                        if event_type == "input_audio_buffer.speech_started":
+                            _audio_gr_input_shown = False
+                            if _response_active:
+                                await ws_send(openai_ws, {"type": "response.cancel"}, logger)
+                            # Tell frontend to stop audio playback immediately
+                            await safe_send({"type": "playback_stop"})
+                            # Finalize current agent message if any
+                            await safe_send({"type": "agent_done"})
 
-                        # ── Guardrail: check user transcript, then trigger response ──
-                        # With create_response=false, we must manually send
-                        # response.create after guardrail passes.
-                        if (
-                            guardrail_mode
-                            and event_type == "conversation.item.input_audio_transcription.completed"
-                        ):
+                        if event_type == "response.created":
+                            _response_active = True
+                        elif event_type in ("response.done", "response.cancelled"):
+                            _response_active = False
+
+                        # ── Text guardrail: call Bedrock via LiteLLM on transcript ──
+                        # FastAPI manages create_response: false flow.
+                        # On transcription.completed, call LiteLLM → Bedrock pre_call.
+                        if event_type == "conversation.item.input_audio_transcription.completed":
                             transcript = event.get("transcript", "")
-                            print(f"[guardrail] transcript: \"{transcript}\"")
-                            if transcript.strip():
-                                # Mode 2: text guardrail on transcript
-                                if guardrail_mode == "post_check":
-                                    result = await _run_text_guardrail(transcript, "input")
-                                    print(f"[guardrail] result: passed={result.passed} msg={result.message}")
-                                    if not result.passed:
-                                        await safe_send({
-                                            "type": "user_done",
-                                            "content": f"[已攔截] {transcript}",
-                                        })
-                                        await forward_debug_event(event, safe_send)
-                                        continue
-                            # Guardrail passed (or Mode 1 audio-only) → trigger AI response
+                            if transcript.strip() and not _is_prompt_leak(transcript):
+                                passed, reason = await _check_text_via_litellm(transcript)
+                                if passed:
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": True,
+                                        "message": "✓ [使用者輸入] 安全檢查通過（LiteLLM → Bedrock）",
+                                    })
+                                else:
+                                    snippet = transcript[:50] + ("…" if len(transcript) > 50 else "")
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": False,
+                                        "message": (
+                                            f"✗ [使用者輸入] 已攔截（LiteLLM → Bedrock）\n"
+                                            f"　內容：「{snippet}」\n"
+                                            f"　原因：{reason}"
+                                        ),
+                                    })
+                                    continue  # Skip response.create
                             await ws_send(openai_ws, {"type": "response.create"}, logger)
-
-                        # ── Output text guardrail (both modes) ──
-                        if (
-                            guardrail_mode in ("pre_check", "post_check")
-                            and event_type == "response.audio_transcript.done"
-                        ):
-                            transcript = event.get("transcript", "")
-                            print(f"[guardrail] Output transcript: \"{transcript[:80]}\"")
-                            if transcript.strip():
-                                result = await _run_text_guardrail(transcript, "output")
-                                print(f"[guardrail] Output result: passed={result.passed} msg={result.message}")
-                                if not result.passed:
-                                    await safe_send(
-                                        {"type": "agent_delta", "content": f"\n[回應已被 Guardrail 攔截: {result.message}]"}
-                                    )
-                                    await safe_send({"type": "agent_done"})
-                                    continue
 
                         # ── Standard event forwarding ──
                         if event_type == "response.audio.delta":
@@ -845,19 +873,35 @@ async def realtime_proxy(client_ws: WebSocket):
                         elif event_type in ("response.output_text.done", "response.done"):
                             await safe_send({"type": "agent_done"})
                             if event_type == "response.done":
+                                # Accumulate real usage from OpenAI
+                                r = event.get("response", {})
+                                usage = r.get("usage") or {}
+                                _total_input_tokens += usage.get("input_tokens", 0)
+                                _total_output_tokens += usage.get("output_tokens", 0)
+                                in_det = usage.get("input_token_details") or {}
+                                out_det = usage.get("output_token_details") or {}
+                                _total_audio_input_tokens += in_det.get("audio_tokens", 0)
+                                _total_audio_output_tokens += out_det.get("audio_tokens", 0)
                                 await forward_debug_event(event, safe_send)
                         elif event_type == "conversation.item.input_audio_transcription.delta":
-                            await safe_send(
-                                {"type": "user_delta", "content": event.get("delta", "")}
-                            )
+                            # Don't stream user deltas — wait for completed to avoid
+                            # showing agent text before user text is finished
+                            pass
                         elif (
                             event_type
                             == "conversation.item.input_audio_transcription.completed"
                         ):
+                            transcript = event.get("transcript", "")
+                            # Show full user text at once (no streaming delay)
+                            # Skip prompt-leak transcripts
+                            if transcript.strip() and not _is_prompt_leak(transcript):
+                                await safe_send(
+                                    {"type": "user_delta", "content": transcript}
+                                )
                             await safe_send(
                                 {
                                     "type": "user_done",
-                                    "content": event.get("transcript", ""),
+                                    "content": transcript,
                                 }
                             )
                             await forward_debug_event(event, safe_send)
@@ -874,28 +918,33 @@ async def realtime_proxy(client_ws: WebSocket):
                             tool_call_buffers.pop(call_id, None)
                             try:
                                 form_payload = json.loads(arguments)
-                                meta = None
-                                audio_seconds = audio_samples_total / 24000 if audio_samples_total else 0
-                                audio_input_tokens = (
-                                    math.ceil(audio_seconds * AUDIO_TOKENS_PER_SECOND)
-                                    if audio_seconds
-                                    else 0
+                                meta = RequestMeta()
+                                # Use real token usage from response.done events
+                                meta.inputTokens = _total_input_tokens
+                                meta.outputTokens = _total_output_tokens
+                                meta.audioInputTokens = _total_audio_input_tokens
+                                meta.audioOutputTokens = _total_audio_output_tokens
+                                # Calculate real cost from model pricing
+                                selected_pricing = _get_model_pricing(selected_model)
+                                text_cost = (
+                                    (_total_input_tokens / 1000) * selected_pricing["text_input_per_1k"]
+                                    + (_total_output_tokens / 1000) * selected_pricing["text_output_per_1k"]
                                 )
+                                audio_cost = (
+                                    (_total_audio_input_tokens / 1000) * selected_pricing["audio_input_per_1k"]
+                                    + (_total_audio_output_tokens / 1000) * selected_pricing["audio_output_per_1k"]
+                                )
+                                meta.cost = round(text_cost + audio_cost, 6)
                                 if client_started_at:
                                     duration_ms = int(
                                         (datetime.now(timezone.utc) - client_started_at).total_seconds()
                                         * 1000
                                     )
-                                    meta = RequestMeta(
-                                        timestamps={
-                                            "startedAt": client_started_at.isoformat(),
-                                            "submittedAt": now_iso(),
-                                            "durationMs": duration_ms,
-                                        }
-                                    )
-                                if audio_input_tokens:
-                                    meta = meta or RequestMeta()
-                                    meta.audioInputTokens = audio_input_tokens
+                                    meta.timestamps = {
+                                        "startedAt": client_started_at.isoformat(),
+                                        "submittedAt": now_iso(),
+                                        "durationMs": duration_ms,
+                                    }
                                 await safe_send(
                                     {
                                         "type": "form_ready",
@@ -930,15 +979,34 @@ async def realtime_proxy(client_ws: WebSocket):
                         ):
                             await forward_debug_event(event, safe_send)
                         elif event_type == "error":
-                            await safe_send({"type": "error", "message": str(event)})
+                            err = event.get("error", {})
+                            code = err.get("code", "")
+                            error_type = err.get("type", "")
+                            msg_text = err.get("message", "")
+                            if code in ("response_cancel_not_active",):
+                                print(f"[litellm] suppressed error: {code}")
+                            elif "Missing required parameter" in msg_text and "turn_detection" in msg_text:
+                                # LiteLLM injects incomplete session.update — harmless, suppress
+                                print(f"[litellm] suppressed turn_detection error (LiteLLM bug)")
+                            elif error_type in ("guardrail_violation", "guardrail_error") or code == "content_policy_violation":
+                                # LiteLLM Bedrock guardrail blocked the input
+                                msg = err.get("message", "違反安全規範")
+                                print(f"[litellm] guardrail violation: {msg}")
+                                await safe_send({
+                                    "type": "guardrail_chat",
+                                    "passed": False,
+                                    "message": f"✗ [使用者輸入] 已攔截（LiteLLM Bedrock Guardrail）\n　原因：{msg}",
+                                })
+                            else:
+                                await safe_send({"type": "error", "message": err.get("message", str(event))})
                 except Exception as exc:
                     await safe_send({"type": "error", "message": str(exc)})
 
             try:
                 await asyncio.gather(receive_from_client(), receive_from_openai())
             finally:
-                if audio_guardrail:
-                    await audio_guardrail.close()
+                if audio_gr_session and audio_gr:
+                    await audio_gr.close_session(audio_gr_session)
     except Exception as exc:
         if client_ws.client_state.name == "CONNECTED":
             await client_ws.send_json({"type": "error", "message": str(exc)})
@@ -948,16 +1016,14 @@ async def realtime_proxy(client_ws: WebSocket):
 @app.websocket("/ws/realtime-stt")
 async def realtime_stt(client_ws: WebSocket):
     await client_ws.accept()
-    if not OPENAI_API_KEY:
-        await client_ws.send_json({"type": "error", "message": "缺少 OPENAI_API_KEY"})
+    if not LITELLM_MASTER_KEY:
+        await client_ws.send_json({"type": "error", "message": "缺少 LITELLM_MASTER_KEY"})
         await client_ws.close()
         return
 
     stt_model = client_ws.query_params.get("model", DEFAULT_REALTIME_MODEL)
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    if OPENAI_BETA_HEADER:
-        headers["OpenAI-Beta"] = OPENAI_BETA_HEADER
+    headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}"}
 
     async def safe_send(payload: dict[str, Any]) -> None:
         if client_ws.client_state.name == "CONNECTED":
@@ -985,8 +1051,14 @@ async def realtime_stt(client_ws: WebSocket):
                     "input_audio_transcription": {
                         "model": OPENAI_TRANSCRIBE_MODEL,
                         "language": OPENAI_TRANSCRIBE_LANG,
+                        **({"prompt": OPENAI_TRANSCRIBE_PROMPT} if OPENAI_TRANSCRIBE_PROMPT else {}),
                     },
-                    "turn_detection": {"type": "server_vad"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.85,
+                        "prefix_padding_ms": 400,
+                        "silence_duration_ms": 1000,
+                    },
                 },
             }
             await ws_send(openai_ws, session_update, logger)
@@ -1035,7 +1107,15 @@ async def realtime_stt(client_ws: WebSocket):
                         ):
                             await forward_debug_event(event, safe_send)
                         elif event_type == "error":
-                            await safe_send({"type": "error", "message": str(event)})
+                            err = event.get("error", {})
+                            code = err.get("code", "")
+                            msg_text = err.get("message", "")
+                            if code in ("response_cancel_not_active",):
+                                print(f"[openai] suppressed error: {code}")
+                            elif "Missing required parameter" in msg_text and "turn_detection" in msg_text:
+                                print(f"[litellm] suppressed turn_detection error (LiteLLM bug)")
+                            else:
+                                await safe_send({"type": "error", "message": err.get("message", str(event))})
                 except Exception as exc:
                     await safe_send({"type": "error", "message": str(exc)})
 
@@ -1057,6 +1137,14 @@ def delete_request(request_id: str) -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.delete("/api/requests")
+def delete_all_requests() -> dict[str, str]:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM requests")
+        conn.execute("DELETE FROM ws_events")
+    return {"status": "ok"}
+
+
 @app.get("/api/sessions")
 def list_sessions() -> list[dict]:
     with get_conn() as conn:
@@ -1071,6 +1159,9 @@ def list_sessions() -> list[dict]:
                 req.token_usage_json,
                 req.payload_json    AS req_payload_json,
                 req.user_duration_ms,
+                req.audio_input_tokens,
+                req.audio_output_tokens,
+                req.guardrail_mode,
                 req.created_at      AS req_created_at
             FROM (
                 SELECT conn_id, session_id, endpoint,
@@ -1087,7 +1178,8 @@ def list_sessions() -> list[dict]:
         orphans = conn.execute(
             """
             SELECT id, mode, cost, token_usage_json, payload_json,
-                   user_duration_ms, created_at
+                   user_duration_ms, audio_input_tokens, audio_output_tokens,
+                   guardrail_mode, created_at
             FROM requests
             WHERE conn_id IS NULL
             ORDER BY created_at DESC
@@ -1115,6 +1207,9 @@ def list_sessions() -> list[dict]:
             "token_usage": json.loads(d.get("token_usage_json") or "{}"),
             "req_payload": json.loads(d.get("payload_json") or "null"),
             "user_duration_ms": d["user_duration_ms"],
+            "audio_input_tokens": d.get("audio_input_tokens", 0),
+            "audio_output_tokens": d.get("audio_output_tokens", 0),
+            "guardrail_mode": d.get("guardrail_mode"),
             "req_created_at": d["created_at"],
         })
     return result
@@ -1158,12 +1253,15 @@ def log_client_error(payload: ClientError) -> dict[str, str]:
 @app.get("/api/guardrail-info")
 def guardrail_info() -> dict:
     """Return guardrail endpoint info for frontend display."""
+    bedrock_id = os.getenv("BEDROCK_GUARDRAIL_ID", "")
     return {
         "audio_ws": os.getenv("GUARDRAIL_WS_URL", ""),
-        "text_mode": "Local pattern-based (Prompt injection / PII / Abuse / Fraud detection)",
+        "text_mode": f"LiteLLM → Bedrock Guardrail ({bedrock_id})" if bedrock_id else "未設定",
+        "litellm_proxy": os.getenv("LITELLM_PROXY_URL", "ws://localhost:4000"),
+        "bedrock_guardrail_id": bedrock_id,
+        "bedrock_region": os.getenv("AWS_DEFAULT_REGION", "us-west-2") if bedrock_id else "",
         "transcription_model": OPENAI_TRANSCRIBE_MODEL,
         "realtime_model": DEFAULT_REALTIME_MODEL,
-        "api_key_set": bool(os.getenv("GUARDRAIL_API_KEY", "")),
     }
 
 

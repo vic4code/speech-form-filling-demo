@@ -41,13 +41,20 @@
             <option value="stt">STT</option>
             <option value="conversation">Conversation</option>
           </select>
+          <select id="log-guardrail" class="log-select">
+            <option value="all">所有 Guardrail</option>
+            <option value="pre_check">Audio + Text</option>
+            <option value="post_check">Text Only</option>
+            <option value="off">Guardrail OFF</option>
+          </select>
           <button class="button secondary" id="log-refresh">重新整理</button>
+          <button class="log-delete-all-btn" id="log-delete-all">全部清除</button>
         </div>
         <div id="logs" class="log-list"></div>
         <div id="logs-empty" class="empty-state" style="display: none;">尚無紀錄</div>
       </section>
     </main>
 
-    <script src="/static/logs.js?v=20260309"></script>
+    <script src="/static/logs.js?v=20260330a"></script>
   </body>
 </html>
