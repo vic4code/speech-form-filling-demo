@@ -23,19 +23,17 @@ model_list:
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
 
+# Audio Guardrail: monkey-patches realtime WebSocket to stream audio to guardrail server
+litellm_settings:
+  callbacks:
+    - audio_guardrail.audio_guardrail_instance
+
+# Text Guardrail: Bedrock endpoint via pre_call hook
 guardrails:
-  # ── Text Guardrail: Bedrock endpoint ──
   - guardrail_name: bedrock-text-guardrail
     litellm_params:
       guardrail: bedrock
       guardrailIdentifier: os.environ/BEDROCK_GUARDRAIL_ID
       guardrailVersion: os.environ/BEDROCK_GUARDRAIL_VERSION
       mode: pre_call
-      default_on: true
-
-  # ── Audio Guardrail: WS streaming endpoint ──
-  - guardrail_name: audio-ws-guardrail
-    litellm_params:
-      guardrail: audio_guardrail.AudioGuardrail
-      mode: during_call
       default_on: true

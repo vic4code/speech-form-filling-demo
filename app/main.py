@@ -22,7 +22,7 @@ import websockets
 
 import httpx
 
-from app.guardrails import GuardrailResult, get_audio_guardrail
+from app.guardrails import GuardrailResult
 
 
 load_dotenv()
@@ -721,25 +721,12 @@ async def realtime_proxy(client_ws: WebSocket):
             client_started_at: datetime | None = None
             audio_samples_total = 0
             _response_active = False
-            _audio_gr_input_shown = False
             # Accumulate real usage from response.done events
             _total_input_tokens = 0
             _total_output_tokens = 0
             _total_audio_input_tokens = 0
             _total_audio_output_tokens = 0
-
-            # ── Audio guardrail via LiteLLM (Mode 1 only) ──
-            audio_gr_session = None
-            if guardrail_mode == "pre_check":
-                audio_gr = get_audio_guardrail()
-                if audio_gr:
-                    audio_gr_session = await audio_gr.connect_session()
-                    if audio_gr_session:
-                        print("[guardrail] Audio guardrail WS connected (via LiteLLM)")
-                    else:
-                        print("[guardrail] Audio guardrail WS failed")
-                else:
-                    print("[guardrail] AudioGuardrail not registered in LiteLLM")
+            # Audio guardrail is fully handled by LiteLLM via monkey patching
 
             async def receive_from_client():
                 nonlocal client_started_at, audio_samples_total
@@ -753,27 +740,6 @@ async def realtime_proxy(client_ws: WebSocket):
                                 audio_samples_total += len(audio_bytes) // 2
                             except (ValueError, TypeError):
                                 pass
-
-                            # Mode 1: stream audio to guardrail server in real-time
-                            if audio_gr_session and audio_gr:
-                                await audio_gr.send_audio(audio_gr_session, message["audio"])
-                                # Check for new results
-                                latest = audio_gr.get_latest_result(audio_gr_session)
-                                if latest and latest.get("status") == "UNSAFE" and not audio_gr_session.get("_notified_unsafe"):
-                                    audio_gr_session["_notified_unsafe"] = True
-                                    process_time = latest.get("process_time_sec", 0)
-                                    await safe_send({
-                                        "type": "guardrail_chat",
-                                        "passed": False,
-                                        "message": f"✗ [使用者輸入] 已攔截（Audio Guardrail via LiteLLM）\n　原因：輸入音訊不安全 (偵測耗時 {process_time:.2f}s)",
-                                    })
-                                elif latest and latest.get("status") == "SAFE" and not _audio_gr_input_shown:
-                                    _audio_gr_input_shown = True
-                                    await safe_send({
-                                        "type": "guardrail_chat",
-                                        "passed": True,
-                                        "message": "✓ [使用者輸入] 音訊安全檢查通過（Audio Guardrail via LiteLLM）",
-                                    })
 
                             await ws_send(
                                 openai_ws,
@@ -820,7 +786,6 @@ async def realtime_proxy(client_ws: WebSocket):
 
                         # ── VAD interruption: user started speaking → cancel AI response ──
                         if event_type == "input_audio_buffer.speech_started":
-                            _audio_gr_input_shown = False
                             if _response_active:
                                 await ws_send(openai_ws, {"type": "response.cancel"}, logger)
                             # Tell frontend to stop audio playback immediately
@@ -988,14 +953,14 @@ async def realtime_proxy(client_ws: WebSocket):
                             elif "Missing required parameter" in msg_text and "turn_detection" in msg_text:
                                 # LiteLLM injects incomplete session.update — harmless, suppress
                                 print(f"[litellm] suppressed turn_detection error (LiteLLM bug)")
-                            elif error_type in ("guardrail_violation", "guardrail_error") or code == "content_policy_violation":
-                                # LiteLLM Bedrock guardrail blocked the input
+                            elif error_type in ("guardrail_violation", "guardrail_error") or code in ("content_policy_violation", "audio_guardrail_violation"):
                                 msg = err.get("message", "違反安全規範")
-                                print(f"[litellm] guardrail violation: {msg}")
+                                source = "Audio Guardrail" if code == "audio_guardrail_violation" else "Bedrock Guardrail"
+                                print(f"[litellm] {source} violation: {msg}")
                                 await safe_send({
                                     "type": "guardrail_chat",
                                     "passed": False,
-                                    "message": f"✗ [使用者輸入] 已攔截（LiteLLM Bedrock Guardrail）\n　原因：{msg}",
+                                    "message": f"✗ [使用者輸入] 已攔截（{source} via LiteLLM）\n　原因：{msg}",
                                 })
                             else:
                                 await safe_send({"type": "error", "message": err.get("message", str(event))})
@@ -1005,8 +970,7 @@ async def realtime_proxy(client_ws: WebSocket):
             try:
                 await asyncio.gather(receive_from_client(), receive_from_openai())
             finally:
-                if audio_gr_session and audio_gr:
-                    await audio_gr.close_session(audio_gr_session)
+                pass  # Audio guardrail cleanup handled by LiteLLM
     except Exception as exc:
         if client_ws.client_state.name == "CONNECTED":
             await client_ws.send_json({"type": "error", "message": str(exc)})
