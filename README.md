@@ -17,16 +17,16 @@ After submission, users are redirected to a **Request Log page** with token usag
 graph LR
     Browser["🌐 Browser<br/>AudioWorklet"]
     FastAPI["⚡ FastAPI :8000<br/>應用邏輯 / 表單 / Logs"]
-    LiteLLM["🔀 LiteLLM :4000<br/>AI Proxy + Guardrails"]
+    LiteLLM["🔀 LiteLLM :4000<br/>AI Proxy + All Guardrails"]
     OpenAI["☁️ OpenAI<br/>Realtime API"]
     Bedrock["🛡️ Bedrock<br/>Text Guardrail"]
-    AudioGR["🎙️ Audio GR<br/>WS Server"]
+    AudioGR["🎙️ Audio Guardrail<br/>WS Server"]
 
     Browser <-->|"WebSocket<br/>audio + events"| FastAPI
     FastAPI <-->|"WebSocket"| LiteLLM
     LiteLLM <-->|"Realtime WS"| OpenAI
-    LiteLLM -->|"pre_call"| Bedrock
-    FastAPI -->|"PCM16 stream"| AudioGR
+    LiteLLM -->|"pre_call<br/>guardrails config"| Bedrock
+    LiteLLM -->|"monkey patch<br/>callbacks config"| AudioGR
 
     style Browser fill:#f0fdf4,stroke:#16a34a
     style FastAPI fill:#eff6ff,stroke:#2563eb
