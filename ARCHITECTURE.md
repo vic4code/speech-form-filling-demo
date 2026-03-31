@@ -1,246 +1,273 @@
-# 語音表單填寫系統 — 架構總覽
+# Speech Form Filling System — Architecture Overview
 
 ## System Architecture
 
 ```mermaid
 graph TB
-    subgraph Browser["🌐 Browser"]
-        UI["HTML/JS UI"]
-        AW["AudioWorklet<br/>PCM16 24kHz"]
+    subgraph Browser["Browser"]
+        UI["HTML / JS UI"]
+        AW["AudioWorklet\nPCM16 24kHz"]
     end
 
-    subgraph FastAPI["⚡ FastAPI :8000"]
+    subgraph App["FastAPI :8000"]
         Proxy["WebSocket Proxy"]
-        App["應用邏輯<br/>表單 / Tool Calling"]
-        DB["SQLite DB<br/>Logs / Token / Cost"]
+        Logic["App Logic\nForm / Tool Calling"]
+        LocalGR["Local Keyword\nGuardrail"]
+        GemmaStream["Gemma Audio\nStreaming"]
+        DB["SQLite\nLogs / Tokens / Cost"]
     end
 
-    subgraph LiteLLM["🔀 LiteLLM Proxy :4000"]
-        Router["模型路由"]
-        GR_Bedrock["Guardrail: Bedrock<br/>guardrails config<br/>pre_call hook"]
-        GR_Audio["Guardrail: Audio<br/>callbacks config<br/>monkey patch receive()"]
+    subgraph Proxy_LLM["LiteLLM Proxy :4000"]
+        Router["Model Router"]
+        BedrockHook["Bedrock Guardrail\npre_call hook"]
     end
 
-    subgraph External["☁️ 外部服務"]
-        OpenAI["OpenAI Realtime API<br/>GPT-4o + gpt-4o-transcribe"]
-        Bedrock["AWS Bedrock<br/>Guardrail Endpoint"]
-        AudioWS["Audio Guardrail<br/>WS Server<br/>multimodal model"]
+    subgraph External["External Services"]
+        OpenAI["OpenAI Realtime API\ngpt-4o / gpt-4o-transcribe"]
+        Bedrock["AWS Bedrock\nGuardrail Endpoint\n(optional, fail-open)"]
+        Gemma["Gemma Audio Guardrail\nWS Server"]
     end
 
-    UI <-->|"WebSocket<br/>audio + events"| Proxy
+    UI <-->|"WebSocket\naudio + events"| Proxy
     AW -->|"PCM16 base64"| Proxy
     Proxy <-->|"WebSocket"| Router
+    GemmaStream -->|"PCM16 16kHz\nreal-time stream"| Gemma
 
     Router <-->|"Realtime WS"| OpenAI
-    GR_Bedrock -->|"ApplyGuardrail API"| Bedrock
-    GR_Audio -->|"PCM16 16kHz<br/>即時串流"| AudioWS
+    LocalGR -.->|"Bedrock check\n(if available)"| BedrockHook
+    BedrockHook -.->|"ApplyGuardrail API"| Bedrock
 
-    Proxy --> App
-    App --> DB
+    Proxy --> Logic
+    Logic --> DB
 
-    style Browser fill:#f0fdf4,stroke:#16a34a
-    style FastAPI fill:#eff6ff,stroke:#2563eb
-    style LiteLLM fill:#fef3c7,stroke:#d97706
-    style External fill:#fdf2f8,stroke:#be185d
+    style Browser fill:#f0fdf4,stroke:#16a34a,color:#14532d
+    style App fill:#eff6ff,stroke:#2563eb,color:#1e3a5f
+    style Proxy_LLM fill:#fef3c7,stroke:#d97706,color:#78350f
+    style External fill:#fdf2f8,stroke:#be185d,color:#831843
 ```
 
-**所有 guardrail 都完全在 LiteLLM 層處理。FastAPI 不碰任何 guardrail endpoint。**
+---
 
-## Sequence Diagram — 正常對話流程
+## Guardrail Modes
+
+| | Mode 1 `pre_check` | Mode 2 `post_check` | Guardrail OFF |
+|---|---|---|---|
+| **Input** | Gemma audio (real-time) + Local keyword fallback | Local keywords (instant) + Bedrock (fail-open) | No check |
+| **Output** | Bedrock only (no local keywords) | Bedrock only (no local keywords) | No check |
+| **create_response** | `false` (manual) | `false` (manual) | `true` (auto) |
+| **Input latency** | ~0ms (parallel audio stream) + instant keyword check | ~1ms (local) + ~200-500ms (Bedrock, pre-flight optimized) | 0ms |
+
+> Output guardrail skips local keywords to avoid false-blocking AI refusal messages (e.g. "I cannot help with bombs" contains "bombs").
+
+---
+
+## Sequence Diagram — Mode 1 (Audio Input Guardrail)
 
 ```mermaid
 sequenceDiagram
-    actor User as 使用者
-    participant Browser as Browser
+    actor User
+    participant Browser
     participant FastAPI as FastAPI :8000
+    participant Gemma as Gemma WS Server
     participant LiteLLM as LiteLLM :4000
     participant OpenAI as OpenAI Realtime
-    participant Bedrock as Bedrock Guardrail
-    participant AudioGR as Audio Guardrail WS
 
-    User->>Browser: 點擊「開始語音」
-    Browser->>FastAPI: WebSocket /ws/realtime
-    FastAPI->>LiteLLM: WebSocket /v1/realtime
+    User ->> Browser: Voice input
+    Browser ->> FastAPI: input_audio_buffer.append (PCM16 24kHz)
 
-    Note over LiteLLM: async_pre_call_hook 觸發<br/>monkey patch WebSocket.receive()
-
-    LiteLLM->>OpenAI: WebSocket 連線
-    FastAPI->>LiteLLM: session.update (create_response: false)
-    LiteLLM->>OpenAI: 轉發 session.update
-
-    Note over User,AudioGR: ── 使用者開始說話 ──
-
-    User->>Browser: 語音輸入
-    Browser->>FastAPI: input_audio_buffer.append (PCM16)
-    FastAPI->>LiteLLM: 轉發 audio
-
-    Note over LiteLLM: monkey patched receive()<br/>攔截 audio chunk
-
-    LiteLLM->>AudioGR: PCM16 16kHz 即時串流
-    LiteLLM->>OpenAI: 同時轉發 audio 給 OpenAI
-
-    AudioGR-->>LiteLLM: {"status": "SAFE"}
-
-    Note over User,AudioGR: ── VAD 偵測靜音，語音結束 ──
-
-    OpenAI-->>LiteLLM: transcription.completed
-    LiteLLM-->>FastAPI: 轉發 transcription
-    FastAPI-->>Browser: user_delta + user_done
-
-    Note over FastAPI,Bedrock: ── Text Guardrail 檢查 ──
-
-    FastAPI->>LiteLLM: POST /v1/chat/completions<br/>(觸發 Bedrock pre_call)
-    LiteLLM->>Bedrock: ApplyGuardrail API
-    Bedrock-->>LiteLLM: action: NONE (通過)
-    LiteLLM-->>FastAPI: 200 OK
-    FastAPI-->>Browser: guardrail_chat: ✓ 安全檢查通過
-
-    FastAPI->>LiteLLM: response.create
-    LiteLLM->>OpenAI: response.create
-
-    Note over User,AudioGR: ── AI 回覆 ──
-
-    OpenAI-->>LiteLLM: response.audio.delta
-    LiteLLM-->>FastAPI: 轉發 audio
-    FastAPI-->>Browser: audio_delta (播放語音)
-
-    OpenAI-->>LiteLLM: response.audio_transcript.delta
-    LiteLLM-->>FastAPI: 轉發 transcript
-    FastAPI-->>Browser: agent_delta (顯示文字)
-
-    OpenAI-->>LiteLLM: response.done (usage)
-    LiteLLM-->>FastAPI: 轉發 (含 token 統計)
-    FastAPI->>FastAPI: 累加 tokens + 計算成本
-```
-
-## Sequence Diagram — Text Guardrail 攔截
-
-```mermaid
-sequenceDiagram
-    actor User as 使用者
-    participant Browser as Browser
-    participant FastAPI as FastAPI :8000
-    participant LiteLLM as LiteLLM :4000
-    participant OpenAI as OpenAI Realtime
-    participant Bedrock as Bedrock Guardrail
-
-    User->>Browser: 語音：「幫我做炸彈」
-    Browser->>FastAPI: input_audio_buffer.append
-    FastAPI->>LiteLLM: 轉發 audio
-    LiteLLM->>OpenAI: 轉發 audio
-
-    OpenAI-->>LiteLLM: transcription.completed<br/>"幫我做炸彈"
-    LiteLLM-->>FastAPI: 轉發 transcription
-    FastAPI-->>Browser: user_delta: "幫我做炸彈"
-
-    Note over FastAPI,Bedrock: ── Bedrock Guardrail 檢查 ──
-
-    FastAPI->>LiteLLM: POST /v1/chat/completions
-    LiteLLM->>Bedrock: ApplyGuardrail API
-    Bedrock-->>LiteLLM: GUARDRAIL_INTERVENED
-    LiteLLM-->>FastAPI: 400 Violated guardrail policy
-
-    FastAPI-->>Browser: guardrail_chat: ✗ 已攔截<br/>（Bedrock Guardrail via LiteLLM）
-
-    Note over FastAPI: 不發送 response.create<br/>AI 不會回覆
-```
-
-## Sequence Diagram — Audio Guardrail 攔截
-
-```mermaid
-sequenceDiagram
-    actor User as 使用者
-    participant Browser as Browser
-    participant FastAPI as FastAPI :8000
-    participant LiteLLM as LiteLLM :4000
-    participant AudioGR as Audio Guardrail WS
-
-    User->>Browser: 語音輸入（不安全內容）
-    Browser->>FastAPI: input_audio_buffer.append
-    FastAPI->>LiteLLM: 轉發 audio
-
-    Note over LiteLLM: monkey patched receive()<br/>攔截 audio chunk
-
-    loop 即時串流（每個 audio chunk）
-        LiteLLM->>AudioGR: PCM16 16kHz binary
+    par Parallel processing
+        FastAPI ->> Gemma: PCM16 16kHz (resampled)
+        FastAPI ->> LiteLLM: Forward audio
+        LiteLLM ->> OpenAI: Forward audio
     end
 
-    AudioGR-->>LiteLLM: {"status": "UNSAFE",<br/>"process_time_sec": 0.71}
+    Gemma -->> FastAPI: {"status": "SAFE/UNSAFE"}
+    FastAPI -->> Browser: guardrail_chat (Gemma Audio result)
 
-    Note over LiteLLM: 注入 error event<br/>到 client WebSocket
+    OpenAI -->> LiteLLM: transcription.completed
+    LiteLLM -->> FastAPI: Forward transcript
+    FastAPI -->> Browser: user_delta + user_done
 
-    LiteLLM-->>FastAPI: error: audio_guardrail_violation
-    FastAPI-->>Browser: guardrail_chat:<br/>✗ [使用者輸入] 已攔截<br/>（Audio Guardrail via LiteLLM）
+    note over FastAPI: Local keyword fallback check (instant)
+
+    FastAPI ->> LiteLLM: response.create
+    LiteLLM ->> OpenAI: response.create
+
+    OpenAI -->> LiteLLM: response.audio_transcript.done
+    note over FastAPI: Output Bedrock check (background)
+    FastAPI -->> Browser: guardrail_chat (output result)
 ```
 
-## Guardrail 註冊方式
+---
 
-```yaml
-# litellm_config.yaml
+## Sequence Diagram — Mode 2 (Text Input Guardrail)
 
-# Audio Guardrail — CustomLogger + monkey patch
-litellm_settings:
-  callbacks:
-    - audio_guardrail.audio_guardrail_instance
+```mermaid
+sequenceDiagram
+    actor User
+    participant Browser
+    participant FastAPI as FastAPI :8000
+    participant LiteLLM as LiteLLM :4000
+    participant OpenAI as OpenAI Realtime
 
-# Text Guardrail — Bedrock pre_call hook
-guardrails:
-  - guardrail_name: bedrock-text-guardrail
-    litellm_params:
-      guardrail: bedrock
-      mode: pre_call
+    User ->> Browser: Voice input
+    Browser ->> FastAPI: input_audio_buffer.append
+    FastAPI ->> LiteLLM: Forward audio
+    LiteLLM ->> OpenAI: Forward audio
+
+    OpenAI -->> FastAPI: transcription.delta
+    note over FastAPI: Pre-flight check fires (≥3 chars)
+
+    OpenAI -->> FastAPI: transcription.completed
+    FastAPI -->> Browser: user_delta + user_done
+
+    rect rgb(254, 243, 199)
+        note over FastAPI: Input text guardrail
+        note over FastAPI: Local keywords (instant) + Bedrock (fail-open)
+        FastAPI -->> Browser: guardrail_chat: input result
+    end
+
+    FastAPI ->> LiteLLM: response.create
+    LiteLLM ->> OpenAI: response.create
+
+    OpenAI -->> FastAPI: response.audio_transcript.done
+    note over FastAPI: Output Bedrock check (background)
+    FastAPI -->> Browser: guardrail_chat: output result
 ```
 
-| Guardrail | 註冊位置 | 技術 | 檢查對象 |
-|-----------|---------|------|---------|
-| **Bedrock Text** | `guardrails:` config | `pre_call` hook | 轉錄文字 (transcript) |
-| **Audio WS** | `litellm_settings.callbacks` | `CustomLogger` monkey patch | 原始音訊串流 (PCM16) |
+---
 
-## 各元件職責
+## Sequence Diagram — No Guardrail
 
-| 元件 | 類型 | 職責 |
-|------|------|------|
-| **FastAPI** (:8000) | 應用服務 | UI、WebSocket proxy、表單、logs、database、`create_response` 管理 |
-| **LiteLLM** (:4000) | AI proxy 微服務 | 模型路由、**所有 guardrail 執行**（text + audio） |
-| **Bedrock Guardrail** | 獨立 API 微服務 | 文字安全檢查（語意理解） |
-| **Audio Guardrail WS** | 獨立 WS 微服務 | 音訊安全檢查（multimodal model） |
-| **OpenAI Realtime API** | 外部服務 | 語音理解、AI 對話、TTS |
+```mermaid
+sequenceDiagram
+    actor User
+    participant Browser
+    participant FastAPI as FastAPI :8000
+    participant LiteLLM as LiteLLM :4000
+    participant OpenAI as OpenAI Realtime
 
-## 關鍵檔案
+    User ->> Browser: Voice input
+    Browser ->> FastAPI: input_audio_buffer.append
+    FastAPI ->> LiteLLM: Forward audio
+    LiteLLM ->> OpenAI: Forward audio
 
-| 檔案 | 用途 |
-|------|------|
-| `litellm_config.yaml` | LiteLLM：模型路由 + guardrail 註冊 |
-| `audio_guardrail.py` | CustomLogger：monkey patch WS → Audio Guardrail 串流 |
-| `start_litellm.py` | LiteLLM 啟動腳本 |
-| `app/main.py` | FastAPI：WebSocket proxy、表單、logs（不碰 guardrail） |
-| `app/guardrails.py` | GuardrailResult dataclass |
-| `static/app.js` | 前端：音訊擷取、聊天 UI、表單 |
-| `.env` | API keys、Bedrock 設定、LiteLLM key |
+    note over OpenAI: VAD detects silence
+    note over OpenAI: create_response: true → auto-respond
 
-## 啟動方式
+    OpenAI -->> FastAPI: transcription.completed
+    FastAPI -->> Browser: user_delta + user_done
+
+    OpenAI -->> FastAPI: response.audio.delta (streaming)
+    FastAPI -->> Browser: audio_delta + agent_delta
+```
+
+---
+
+## Sequence Diagram — Function Calling (submit_form)
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant FastAPI as FastAPI :8000
+    participant OpenAI as OpenAI Realtime
+
+    OpenAI -->> FastAPI: response.function_call_arguments.done
+    note over FastAPI: Parse form payload (JSON)
+
+    FastAPI -->> Browser: form_ready (payload + meta)
+    note over Browser: Populate form fields with animation
+
+    FastAPI ->> OpenAI: conversation.item.create (function_call_output)
+    FastAPI ->> OpenAI: response.create
+    OpenAI -->> FastAPI: AI confirms submission
+```
+
+---
+
+## Text Guardrail — Two-Layer Check
+
+```
+Input text
+   │
+   ▼
+Layer 1: Local keyword patterns (instant, always available)
+   ├── Prompt injection (Chinese + English)
+   ├── Data exfiltration / PII
+   ├── Abuse / profanity (繁體 + 簡體 + English)
+   ├── Violence / crime (繁體 + 簡體)
+   ├── Expense fraud
+   ├── Code injection
+   └── Custom keywords (GUARDRAIL_BLOCK_KEYWORDS env)
+   │
+   ├─ BLOCKED → return immediately
+   │
+   ▼
+Layer 2: Bedrock via LiteLLM (optional, fail-open)
+   │
+   ├─ BLOCKED → return
+   ├─ ERROR → allow (fail-open)
+   │
+   ▼
+PASSED
+```
+
+---
+
+## Component Responsibilities
+
+| Component | Type | Responsibilities |
+|-----------|------|-----------------|
+| **FastAPI** (:8000) | App server | UI, WebSocket proxy, Gemma audio streaming, local keyword guardrail, form logic, logs, `create_response` control |
+| **LiteLLM** (:4000) | AI proxy | Model routing, Bedrock guardrail pre_call hook |
+| **Gemma WS Server** | External WS | Audio-level safety (multimodal Gemma model) |
+| **Bedrock Guardrail** | External API | Text safety — semantic understanding (optional, fail-open) |
+| **OpenAI Realtime API** | External service | Speech understanding, AI conversation, TTS |
+
+---
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `app/main.py` | FastAPI: WebSocket proxy, Gemma streaming, text guardrail orchestration, form, logs |
+| `app/guardrails.py` | Local keyword patterns (繁體 + 簡體) + Bedrock integration |
+| `audio_guardrail.py` | LiteLLM callback (no-op, kept for config compatibility) |
+| `litellm_config.yaml` | LiteLLM: model routing + Bedrock guardrail registration |
+| `start_litellm.py` | LiteLLM startup script |
+| `static/app.js` | Frontend: audio capture, chat UI, form, guardrail display |
+| `.env` | API keys, Bedrock config, Gemma WS URL |
+
+---
+
+## Startup
 
 ```bash
-# 1. 啟動 LiteLLM Proxy（所有 guardrail 在此初始化）
+# 1. Start LiteLLM Proxy
 uv run python start_litellm.py &
 
-# 2. 啟動 FastAPI（應用層）
+# 2. Start FastAPI
 uv run uvicorn app.main:app --reload --port 8000
 ```
 
-## 環境變數
+---
 
-| 變數 | 用途 |
-|------|------|
-| `OPENAI_API_KEY` | OpenAI API key（LiteLLM 使用） |
-| `LITELLM_PROXY_URL` | LiteLLM proxy URL（FastAPI 連線用） |
-| `LITELLM_MASTER_KEY` | LiteLLM 認證 key |
-| `BEDROCK_GUARDRAIL_ID` | Bedrock guardrail ID（LiteLLM 使用） |
-| `BEDROCK_GUARDRAIL_VERSION` | Bedrock guardrail 版本 |
-| `AWS_*` | AWS 憑證（LiteLLM Bedrock 使用） |
-| `GUARDRAIL_WS_URL` | Audio guardrail WS URL（LiteLLM callback 使用） |
-| `GUARDRAIL_API_KEY` | Audio guardrail API key |
+## Environment Variables
 
-## 風險評估
+| Variable | Purpose |
+|----------|---------|
+| `OPENAI_API_KEY` | OpenAI API key (used by LiteLLM) |
+| `LITELLM_PROXY_URL` | LiteLLM proxy URL (default: `ws://localhost:4000`) |
+| `LITELLM_MASTER_KEY` | LiteLLM auth key |
+| `GUARDRAIL_WS_URL` | Gemma audio guardrail WS URL (Mode 1) |
+| `GUARDRAIL_API_KEY` | Gemma audio guardrail API key |
+| `GUARDRAIL_BLOCK_KEYWORDS` | Additional comma-separated blocked keywords |
+| `BEDROCK_GUARDRAIL_ID` | Bedrock guardrail ID (optional, fail-open) |
+| `BEDROCK_GUARDRAIL_VERSION` | Bedrock guardrail version |
+| `AWS_*` | AWS credentials (for Bedrock) |
 
-詳見 [GUARDRAIL_RISKS.md](GUARDRAIL_RISKS.md)
+---
+
+## Risk Assessment
+
+See [GUARDRAIL_RISKS.md](GUARDRAIL_RISKS.md) for details.

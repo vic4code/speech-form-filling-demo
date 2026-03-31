@@ -3,16 +3,22 @@ model_list:
     litellm_params:
       model: openai/gpt-4o-realtime-preview-2024-12-17
       api_key: os.environ/OPENAI_API_KEY
+    model_info:
+      mode: realtime
 
   - model_name: openai/gpt-4o-realtime-preview-2024-10-01
     litellm_params:
       model: openai/gpt-4o-realtime-preview-2024-10-01
       api_key: os.environ/OPENAI_API_KEY
+    model_info:
+      mode: realtime
 
   - model_name: openai/gpt-4o-mini-realtime-preview-2024-12-17
     litellm_params:
       model: openai/gpt-4o-mini-realtime-preview-2024-12-17
       api_key: os.environ/OPENAI_API_KEY
+    model_info:
+      mode: realtime
 
   # Text model for guardrail pre_call checks
   - model_name: openai/gpt-4o-mini
@@ -36,4 +42,4 @@ guardrails:
       guardrailIdentifier: os.environ/BEDROCK_GUARDRAIL_ID
       guardrailVersion: os.environ/BEDROCK_GUARDRAIL_VERSION
       mode: pre_call
-      default_on: true
+      default_on: false
