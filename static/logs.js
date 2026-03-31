@@ -92,8 +92,10 @@ const renderSessions = (items) => {
     const tokenMeta = `<span class="log-metric">Tokens: ${totalTokens} (Text ${textIn}+${textOut} / Audio ${audioIn}+${audioOut})</span>`;
 
     const deleteBtn = s.req_id
-      ? `<button class="log-delete-btn" data-id="${s.req_id}" title="刪除此筆紀錄">✕</button>`
-      : "";
+      ? `<button class="log-delete-btn" data-id="${s.req_id}" title="Delete">✕</button>`
+      : s.conn_id
+        ? `<button class="log-delete-btn" data-conn="${s.conn_id}" title="Delete">✕</button>`
+        : `<button class="log-delete-btn" disabled title="No ID">✕</button>`;
 
     const payloadSection = s.req_payload
       ? `<details>
@@ -198,9 +200,14 @@ logsContainer.addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement) || !target.classList.contains("log-delete-btn")) return;
   const requestId = target.dataset.id;
-  if (!requestId || !window.confirm("確定要刪除這筆紀錄嗎？")) return;
+  const connId = target.dataset.conn;
+  if (!requestId && !connId) return;
+  if (!window.confirm("確定要刪除這筆紀錄嗎？")) return;
   try {
-    const response = await fetch(`/api/requests/${requestId}`, { method: "DELETE" });
+    const url = requestId
+      ? `/api/requests/${requestId}`
+      : `/api/ws-sessions/${connId}`;
+    const response = await fetch(url, { method: "DELETE" });
     if (!response.ok) throw new Error("delete failed");
     await loadSessions();
   } catch {

@@ -556,24 +556,26 @@ textarea {
 }
 
 .log-delete-btn {
-  width: 28px;
-  height: 28px;
-  border: none;
+  width: 32px;
+  height: 32px;
+  border: 1px solid #e5e7eb;
   border-radius: 8px;
-  background: transparent;
-  color: var(--muted);
-  font-size: 14px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 16px;
+  font-weight: bold;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: background 0.15s, color 0.15s;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
 
 .log-delete-btn:hover {
   background: #fee2e2;
-  color: #b91c1c;
+  color: #991b1b;
+  border-color: #fca5a5;
 }
 
 .log-delete-all-btn {

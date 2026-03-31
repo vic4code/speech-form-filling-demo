@@ -6,6 +6,8 @@ import sqlite3
 import asyncio
 import base64
 import time
+
+import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -22,7 +24,7 @@ import websockets
 
 import httpx
 
-from app.guardrails import GuardrailResult
+from app.guardrails import GuardrailResult, check_text_local
 
 
 load_dotenv()
@@ -62,10 +64,13 @@ def _get_model_pricing(model: str) -> dict:
     return REALTIME_MODELS.get(model, REALTIME_MODELS[DEFAULT_REALTIME_MODEL])
 
 
-def _realtime_url(model: str) -> str:
+def _realtime_url(model: str, guardrail: str | None = None) -> str:
     """Build the LiteLLM proxy Realtime WebSocket URL for a given model."""
     base = os.getenv("LITELLM_PROXY_URL", "ws://localhost:4000")
-    return f"{base}/v1/realtime?model=openai/{model}"
+    url = f"{base}/v1/realtime?model=openai/{model}"
+    if guardrail:
+        url += f"&guardrail={guardrail}"
+    return url
 
 
 LITELLM_MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "")
@@ -102,39 +107,94 @@ def _is_prompt_leak(transcript: str) -> bool:
         return False
     t = transcript.strip().replace(" ", "")
     p = OPENAI_TRANSCRIBE_PROMPT.strip().replace(" ", "")
-    # Check if transcript is mostly the prompt (>60% overlap)
     if len(t) < 5:
         return False
-    return t in p or p in t or (len(set(t) & set(p)) / len(set(t)) > 0.8 and len(t) > 20)
+    # Only exact match (user transcript IS the prompt verbatim)
+    return t == p
 
 
-async def _check_text_via_litellm(text: str) -> tuple[bool, str]:
-    """Check text via LiteLLM → Bedrock guardrail (pre_call).
+_guardrail_http: httpx.AsyncClient | None = None
 
-    Calls LiteLLM's /chat/completions with a dummy request.
-    If Bedrock guardrail blocks, LiteLLM returns 400.
+
+def _get_guardrail_http() -> httpx.AsyncClient:
+    """Reuse a single httpx client for guardrail checks (connection pooling)."""
+    global _guardrail_http
+    if _guardrail_http is None or _guardrail_http.is_closed:
+        _guardrail_http = httpx.AsyncClient(timeout=5)
+    return _guardrail_http
+
+
+async def _check_text_guardrail(text: str, source: str = "INPUT") -> tuple[bool, str]:
+    """Check text: local patterns first (instant), then Bedrock via LiteLLM (if available).
+
     Returns (passed, reason).
+    """
+    # Layer 1: Local keyword check — instant, always available
+    passed, reason = check_text_local(text)
+    if not passed:
+        print(f"[guardrail] LOCAL BLOCKED ({source}): {reason}")
+        return False, reason
+
+    # Layer 2: Bedrock via LiteLLM — may fail, fail-open
+    litellm_url = os.getenv("LITELLM_PROXY_URL", "ws://localhost:4000").replace("ws://", "http://").replace("wss://", "https://")
+    try:
+        client = _get_guardrail_http()
+        resp = await client.post(
+            f"{litellm_url}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {LITELLM_MASTER_KEY}",
+                "Guardrail-Name": "bedrock-text-guardrail",
+            },
+            json={
+                "model": "openai/gpt-4o-mini",
+                "messages": [{"role": "user", "content": text}],
+                "max_tokens": 1,
+            },
+        )
+        if resp.status_code == 200:
+            return True, ""
+        err = resp.json().get("error", {})
+        msg = err.get("message", "")
+        if resp.status_code == 400 and "guardrail" in msg.lower():
+            print(f"[guardrail] BEDROCK BLOCKED ({source}): {msg}")
+            return False, msg
+        # Non-guardrail error → already passed local check, allow
+        print(f"[guardrail] Bedrock unavailable ({resp.status_code}), local check passed")
+        return True, ""
+    except Exception as exc:
+        print(f"[guardrail] LiteLLM unreachable: {exc}, local check passed")
+        return True, ""
+
+
+async def _check_output_bedrock(text: str) -> tuple[bool, str]:
+    """Check AI output via Bedrock only (no local keywords).
+
+    Skips local keyword check to avoid false-blocking AI refusal messages
+    like "I cannot help make bombs" which contain blocked keywords.
     """
     litellm_url = os.getenv("LITELLM_PROXY_URL", "ws://localhost:4000").replace("ws://", "http://").replace("wss://", "https://")
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{litellm_url}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"},
-                json={
-                    "model": "openai/gpt-4o-mini",
-                    "messages": [{"role": "user", "content": text}],
-                    "max_tokens": 1,
-                },
-            )
-            if resp.status_code == 200:
-                return True, ""
-            # Guardrail blocked
-            err = resp.json().get("error", {})
-            return False, err.get("message", "違反安全規範")
-    except Exception as exc:
-        print(f"[guardrail] LiteLLM check failed: {exc}")
-        # Fail open — allow if LiteLLM is down
+        client = _get_guardrail_http()
+        resp = await client.post(
+            f"{litellm_url}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {LITELLM_MASTER_KEY}",
+                "Guardrail-Name": "bedrock-text-guardrail",
+            },
+            json={
+                "model": "openai/gpt-4o-mini",
+                "messages": [{"role": "user", "content": text}],
+                "max_tokens": 1,
+            },
+        )
+        if resp.status_code == 200:
+            return True, ""
+        err = resp.json().get("error", {})
+        msg = err.get("message", "")
+        if resp.status_code == 400 and "guardrail" in msg.lower():
+            return False, msg
+        return True, ""
+    except Exception:
         return True, ""
 
 
@@ -658,13 +718,21 @@ async def realtime_proxy(client_ws: WebSocket):
 
     try:
         async with websockets.connect(
-            _realtime_url(selected_model), additional_headers=headers
+            _realtime_url(selected_model, guardrail_mode), additional_headers=headers
         ) as openai_ws:
             logger = RealtimeTurnLogger("realtime")
 
             async def safe_send(payload: dict[str, Any]) -> None:
                 if client_ws.client_state.name == "CONNECTED":
                     await client_ws.send_json(payload)
+
+            async def safe_response_create() -> None:
+                """Send response.create with lock to prevent duplicates."""
+                nonlocal _response_active
+                async with _response_lock:
+                    if not _response_active:
+                        _response_active = True  # Set immediately to prevent race
+                        await ws_send(openai_ws, {"type": "response.create"}, logger)
 
             raw = await openai_ws.recv()
             init_event = json.loads(raw)
@@ -704,9 +772,9 @@ async def realtime_proxy(client_ws: WebSocket):
                     },
                     "turn_detection": {
                         "type": "server_vad",
-                        # Always disable auto-response so we can run text guardrail
-                        # on user transcript before triggering response.create
-                        "create_response": False,
+                        # Only disable auto-response when guardrail is on
+                        # (need to check transcript before triggering response)
+                        "create_response": not bool(guardrail_mode),
                         "threshold": 0.85,
                         "prefix_padding_ms": 400,
                         "silence_duration_ms": 1000,
@@ -721,15 +789,58 @@ async def realtime_proxy(client_ws: WebSocket):
             client_started_at: datetime | None = None
             audio_samples_total = 0
             _response_active = False
+            _response_lock = asyncio.Lock()  # Prevent duplicate response.create
             # Accumulate real usage from response.done events
             _total_input_tokens = 0
             _total_output_tokens = 0
             _total_audio_input_tokens = 0
             _total_audio_output_tokens = 0
-            # Audio guardrail is fully handled by LiteLLM via monkey patching
+            # ── Gemma audio guardrail (Mode 1) — streamed from FastAPI layer ──
+            _gemma_ws = None
+            _gemma_ws_url = ""
+            if guardrail_mode == "pre_check":
+                _base = os.getenv("GUARDRAIL_WS_URL", "")
+                _api_key = os.getenv("GUARDRAIL_API_KEY", "")
+                if _base:
+                    sep = "&" if "?" in _base else "?"
+                    _gemma_ws_url = f"{_base}{sep}api_key={_api_key}" if _api_key else _base
+
+            _gemma_shown = False  # Only show one result per speech turn
+
+            async def _gemma_listen(ws) -> None:
+                """Background: listen for Gemma results, send to browser."""
+                nonlocal _gemma_shown
+                try:
+                    while True:
+                        response = await ws.recv()
+                        result = json.loads(
+                            response.decode("utf-8") if isinstance(response, bytes) else response
+                        )
+                        if result.get("event") == "guardrail_result":
+                            status = result.get("status")
+                            pt = result.get("process_time_sec", 0)
+                            conf = result.get("confidence", 0)
+                            print(f"[Gemma] {status} (conf={conf:.2f}, {pt:.2f}s) shown={_gemma_shown}")
+                            if _gemma_shown:
+                                continue  # Skip duplicate results for same turn
+                            _gemma_shown = True
+                            if status == "UNSAFE":
+                                await safe_send({
+                                    "type": "guardrail_chat",
+                                    "passed": False,
+                                    "message": f"✗ [使用者輸入] 已攔截（Gemma Audio）\n　原因：Audio unsafe ({pt:.2f}s, conf={conf:.0%})",
+                                })
+                            else:
+                                await safe_send({
+                                    "type": "guardrail_chat",
+                                    "passed": True,
+                                    "message": f"✓ [使用者輸入] 安全檢查通過（Gemma Audio）",
+                                })
+                except Exception as e:
+                    print(f"[Gemma] listener stopped: {e}")
 
             async def receive_from_client():
-                nonlocal client_started_at, audio_samples_total
+                nonlocal client_started_at, audio_samples_total, _gemma_ws
                 try:
                     while True:
                         data = await client_ws.receive_text()
@@ -739,7 +850,27 @@ async def realtime_proxy(client_ws: WebSocket):
                                 audio_bytes = base64.b64decode(message["audio"])
                                 audio_samples_total += len(audio_bytes) // 2
                             except (ValueError, TypeError):
-                                pass
+                                audio_bytes = b""
+
+                            # Stream to Gemma audio guardrail (Mode 1)
+                            if _gemma_ws_url and audio_bytes:
+                                try:
+                                    # websockets lib: state=1 means OPEN
+                                    is_open = _gemma_ws is not None and getattr(_gemma_ws, "state", 0) == 1
+                                    if not is_open:
+                                        _gemma_ws = await websockets.connect(_gemma_ws_url)
+                                        asyncio.create_task(_gemma_listen(_gemma_ws))
+                                        print("[Gemma] WS connected")
+                                    resampled = np.frombuffer(audio_bytes, dtype=np.int16)
+                                    n = int(len(resampled) * 16000 / 24000)
+                                    if n > 0:
+                                        out = np.interp(
+                                            np.linspace(0, len(resampled), n, endpoint=False),
+                                            np.arange(len(resampled)), resampled
+                                        ).astype(np.int16).tobytes()
+                                        await _gemma_ws.send(out)
+                                except Exception as e:
+                                    print(f"[Gemma] stream error: {e}")
 
                             await ws_send(
                                 openai_ws,
@@ -755,7 +886,7 @@ async def realtime_proxy(client_ws: WebSocket):
                                 except ValueError:
                                     client_started_at = None
                         elif "text" in message:
-                            # Text input — LiteLLM handles guardrail check
+                            # Text input from chat box
                             await ws_send(
                                 openai_ws,
                                 {
@@ -768,7 +899,7 @@ async def realtime_proxy(client_ws: WebSocket):
                                 },
                                 logger,
                             )
-                            await ws_send(openai_ws, {"type": "response.create"}, logger)
+                            await safe_response_create()
                 except WebSocketDisconnect:
                     return
                 except Exception as exc:
@@ -777,6 +908,13 @@ async def realtime_proxy(client_ws: WebSocket):
             async def receive_from_openai():
                 nonlocal _response_active, _total_input_tokens, _total_output_tokens
                 nonlocal _total_audio_input_tokens, _total_audio_output_tokens
+
+                # ── Pre-flight guardrail: accumulate deltas → fire check early ──
+                _delta_buf = ""  # accumulates transcription.delta text
+                _preflight_task: asyncio.Task | None = None
+                _preflight_text = ""  # the text we sent to pre-flight
+                _bg_tasks: list[asyncio.Task] = []  # prevent GC of background tasks
+
                 try:
                     async for raw in openai_ws:
                         event = json.loads(raw)
@@ -786,44 +924,60 @@ async def realtime_proxy(client_ws: WebSocket):
 
                         # ── VAD interruption: user started speaking → cancel AI response ──
                         if event_type == "input_audio_buffer.speech_started":
+                            _gemma_shown = False  # Reset for new speech turn
                             if _response_active:
                                 await ws_send(openai_ws, {"type": "response.cancel"}, logger)
                             # Tell frontend to stop audio playback immediately
                             await safe_send({"type": "playback_stop"})
                             # Finalize current agent message if any
                             await safe_send({"type": "agent_done"})
+                            # Reset pre-flight state for new utterance
+                            _delta_buf = ""
+                            if _preflight_task and not _preflight_task.done():
+                                _preflight_task.cancel()
+                            _preflight_task = None
+                            _preflight_text = ""
 
                         if event_type == "response.created":
                             _response_active = True
                         elif event_type in ("response.done", "response.cancelled"):
                             _response_active = False
 
-                        # ── Text guardrail: call Bedrock via LiteLLM on transcript ──
-                        # FastAPI manages create_response: false flow.
-                        # On transcription.completed, call LiteLLM → Bedrock pre_call.
-                        if event_type == "conversation.item.input_audio_transcription.completed":
-                            transcript = event.get("transcript", "")
-                            if transcript.strip() and not _is_prompt_leak(transcript):
-                                passed, reason = await _check_text_via_litellm(transcript)
-                                if passed:
-                                    await safe_send({
-                                        "type": "guardrail_chat",
-                                        "passed": True,
-                                        "message": "✓ [使用者輸入] 安全檢查通過（LiteLLM → Bedrock）",
-                                    })
-                                else:
-                                    snippet = transcript[:50] + ("…" if len(transcript) > 50 else "")
-                                    await safe_send({
-                                        "type": "guardrail_chat",
-                                        "passed": False,
-                                        "message": (
-                                            f"✗ [使用者輸入] 已攔截（LiteLLM → Bedrock）\n"
-                                            f"　內容：「{snippet}」\n"
-                                            f"　原因：{reason}"
-                                        ),
-                                    })
-                                    continue  # Skip response.create
-                            await ws_send(openai_ws, {"type": "response.create"}, logger)
+                        # ── Output guardrail: check AI transcript via Bedrock ──
+                        # Runs as background task to not block event processing.
+                        # Input guardrail will await this task before proceeding
+                        # to guarantee display order.
+                        if event_type == "response.audio_transcript.done":
+                            output_transcript = event.get("transcript", "")
+                            if guardrail_mode and output_transcript.strip():
+                                async def _do_output_check(text: str) -> None:
+                                    try:
+                                        # Output uses Bedrock only (no local keywords)
+                                        # to avoid false-blocking AI refusal messages
+                                        # e.g. "I cannot help make bombs" contains "bombs" keyword
+                                        o_passed, o_reason = await _check_output_bedrock(text)
+                                        if o_passed:
+                                            await safe_send({
+                                                "type": "guardrail_chat",
+                                                "passed": True,
+                                                "message": "✓ [AI 輸出] 安全檢查通過（Text Guardrail）",
+                                            })
+                                        else:
+                                            snippet = text[:50] + ("…" if len(text) > 50 else "")
+                                            await safe_send({
+                                                "type": "guardrail_chat",
+                                                "passed": False,
+                                                "message": (
+                                                    f"✗ [AI 輸出] 已攔截（Text Guardrail）\n"
+                                                    f"　內容：「{snippet}」\n"
+                                                    f"　原因：{o_reason}"
+                                                ),
+                                            })
+                                    except Exception as e:
+                                        print(f"[guardrail] output check error: {e}")
+                                task = asyncio.create_task(_do_output_check(output_transcript))
+                                _bg_tasks = [t for t in _bg_tasks if not t.done()]
+                                _bg_tasks.append(task)
 
                         # ── Standard event forwarding ──
                         if event_type == "response.audio.delta":
@@ -849,27 +1003,98 @@ async def realtime_proxy(client_ws: WebSocket):
                                 _total_audio_output_tokens += out_det.get("audio_tokens", 0)
                                 await forward_debug_event(event, safe_send)
                         elif event_type == "conversation.item.input_audio_transcription.delta":
-                            # Don't stream user deltas — wait for completed to avoid
-                            # showing agent text before user text is finished
-                            pass
+                            # ── Accumulate delta + pre-fire guardrail check ──
+                            delta_text = event.get("delta", "")
+                            _delta_buf += delta_text
+                            # Fire pre-flight guardrail check once we have enough text (Mode 2 only)
+                            if guardrail_mode == "post_check" and len(_delta_buf) >= 3 and _preflight_task is None:
+                                _preflight_text = _delta_buf
+                                _preflight_task = asyncio.create_task(
+                                    _check_text_guardrail(_preflight_text)
+                                )
+                                print(f"[guardrail] pre-flight check fired: \"{_preflight_text[:30]}\"")
                         elif (
                             event_type
                             == "conversation.item.input_audio_transcription.completed"
                         ):
                             transcript = event.get("transcript", "")
-                            # Show full user text at once (no streaming delay)
-                            # Skip prompt-leak transcripts
-                            if transcript.strip() and not _is_prompt_leak(transcript):
+                            is_valid = transcript.strip() and not _is_prompt_leak(transcript)
+                            # Always show user text first
+                            if is_valid:
                                 await safe_send(
                                     {"type": "user_delta", "content": transcript}
                                 )
                             await safe_send(
-                                {
-                                    "type": "user_done",
-                                    "content": transcript,
-                                }
+                                {"type": "user_done", "content": transcript}
                             )
                             await forward_debug_event(event, safe_send)
+
+                            # ── Input text guardrail ──
+                            # Mode 1: Gemma (audio) + local keyword fallback on transcript
+                            # Mode 2: Local keyword + Bedrock (full text check)
+                            blocked = False
+                            if guardrail_mode == "pre_check" and is_valid:
+                                # Mode 1 fallback: local keyword check on transcript
+                                local_passed, local_reason = check_text_local(transcript)
+                                if not local_passed:
+                                    blocked = True
+                                    snippet = transcript[:50] + ("…" if len(transcript) > 50 else "")
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": False,
+                                        "message": (
+                                            f"✗ [使用者輸入] 已攔截（Gemma Audio）\n"
+                                            f"　內容：「{snippet}」\n"
+                                            f"　原因：{local_reason}"
+                                        ),
+                                    })
+                            elif guardrail_mode == "post_check" and is_valid:
+                                # Try to reuse pre-flight result if text matches
+                                if _preflight_task and _preflight_text == transcript:
+                                    print(f"[guardrail] reusing pre-flight result (exact match)")
+                                    passed, reason = await _preflight_task
+                                elif _preflight_task and _preflight_task.done():
+                                    print(f"[guardrail] final transcript differs, re-checking")
+                                    passed, reason = await _check_text_guardrail(transcript)
+                                else:
+                                    if _preflight_task and not _preflight_task.done():
+                                        pre_passed, _ = await _preflight_task
+                                        if not pre_passed:
+                                            passed, reason = pre_passed, _
+                                            print(f"[guardrail] pre-flight caught violation")
+                                        else:
+                                            passed, reason = await _check_text_guardrail(transcript)
+                                    else:
+                                        passed, reason = await _check_text_guardrail(transcript)
+
+                                if passed:
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": True,
+                                        "message": "✓ [使用者輸入] 安全檢查通過（Text Guardrail）",
+                                    })
+                                else:
+                                    blocked = True
+                                    snippet = transcript[:50] + ("…" if len(transcript) > 50 else "")
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": False,
+                                        "message": (
+                                            f"✗ [使用者輸入] 已攔截（Text Guardrail）\n"
+                                            f"　內容：「{snippet}」\n"
+                                            f"　原因：{reason}"
+                                        ),
+                                    })
+
+                            # Reset pre-flight state
+                            _delta_buf = ""
+                            _preflight_task = None
+                            _preflight_text = ""
+
+                            if not blocked and guardrail_mode:
+                                # Only manually send response.create when guardrail is on
+                                # (create_response: false). Without guardrail, OpenAI auto-responds.
+                                await safe_response_create()
                         elif event_type == "response.function_call_arguments.delta":
                             call_id = event.get("call_id", "default")
                             tool_call_buffers[call_id] = tool_call_buffers.get(
@@ -932,6 +1157,11 @@ async def realtime_proxy(client_ws: WebSocket):
                                     },
                                     logger,
                                 )
+                                # After function call output, always trigger AI to confirm
+                                # Use direct send (not safe_response_create) because
+                                # the previous response already completed
+                                _response_active = False
+                                await ws_send(openai_ws, {"type": "response.create"}, logger)
                             except Exception as exc:
                                 await safe_send({"type": "error", "message": str(exc)})
                         elif event_type in ("session.created", "session.updated"):
@@ -943,6 +1173,11 @@ async def realtime_proxy(client_ws: WebSocket):
                             "response.created",
                         ):
                             await forward_debug_event(event, safe_send)
+                        elif event_type == "guardrail_chat":
+                            # Forwarded from audio_guardrail.py (Gemma SAFE/UNSAFE result)
+                            print(f"[guardrail] received guardrail_chat from LiteLLM: {event.get('message', '')[:50]}")
+                            if guardrail_mode:
+                                await safe_send(event)
                         elif event_type == "error":
                             err = event.get("error", {})
                             code = err.get("code", "")
@@ -953,15 +1188,32 @@ async def realtime_proxy(client_ws: WebSocket):
                             elif "Missing required parameter" in msg_text and "turn_detection" in msg_text:
                                 # LiteLLM injects incomplete session.update — harmless, suppress
                                 print(f"[litellm] suppressed turn_detection error (LiteLLM bug)")
-                            elif error_type in ("guardrail_violation", "guardrail_error") or code in ("content_policy_violation", "audio_guardrail_violation"):
-                                msg = err.get("message", "違反安全規範")
-                                source = "Audio Guardrail" if code == "audio_guardrail_violation" else "Bedrock Guardrail"
-                                print(f"[litellm] {source} violation: {msg}")
-                                await safe_send({
-                                    "type": "guardrail_chat",
-                                    "passed": False,
-                                    "message": f"✗ [使用者輸入] 已攔截（{source} via LiteLLM）\n　原因：{msg}",
-                                })
+                            elif code == "audio_guardrail_safe":
+                                # Gemma SAFE result
+                                msg = err.get("message", "")
+                                if guardrail_mode:
+                                    print(f"[litellm] Gemma SAFE: {msg}")
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": True,
+                                        "message": f"✓ [使用者輸入] 安全檢查通過（Gemma）",
+                                    })
+                            elif (
+                                error_type in ("guardrail_violation", "guardrail_error")
+                                or code in ("content_policy_violation", "audio_guardrail_violation")
+                                or "guardrail" in msg_text.lower()
+                            ):
+                                msg = err.get("message", "")
+                                source = "Gemma" if code == "audio_guardrail_violation" else "Text Guardrail"
+                                if not guardrail_mode:
+                                    print(f"[litellm] suppressed {source} error (guardrail not enabled): {msg}")
+                                else:
+                                    print(f"[litellm] {source} BLOCKED: {msg}")
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": False,
+                                        "message": f"✗ [使用者輸入] 已攔截（{source}）\n　原因：{msg}",
+                                    })
                             else:
                                 await safe_send({"type": "error", "message": err.get("message", str(event))})
                 except Exception as exc:
@@ -1109,6 +1361,14 @@ def delete_all_requests() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.delete("/api/ws-sessions/{conn_id}")
+def delete_ws_session(conn_id: str) -> dict[str, str]:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM ws_events WHERE conn_id = ?", (conn_id,))
+        conn.execute("DELETE FROM requests WHERE conn_id = ?", (conn_id,))
+    return {"status": "ok"}
+
+
 @app.get("/api/sessions")
 def list_sessions() -> list[dict]:
     with get_conn() as conn:
@@ -1220,7 +1480,7 @@ def guardrail_info() -> dict:
     bedrock_id = os.getenv("BEDROCK_GUARDRAIL_ID", "")
     return {
         "audio_ws": os.getenv("GUARDRAIL_WS_URL", ""),
-        "text_mode": f"LiteLLM → Bedrock Guardrail ({bedrock_id})" if bedrock_id else "未設定",
+        "text_mode": f"Bedrock Guardrail ({bedrock_id})" if bedrock_id else "未設定",
         "litellm_proxy": os.getenv("LITELLM_PROXY_URL", "ws://localhost:4000"),
         "bedrock_guardrail_id": bedrock_id,
         "bedrock_region": os.getenv("AWS_DEFAULT_REGION", "us-west-2") if bedrock_id else "",
