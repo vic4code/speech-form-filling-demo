@@ -15,13 +15,22 @@ Protocol:
 """
 
 import os
+import sys
 import json
 import asyncio
 import base64
+import logging
 
 import numpy as np
 import websockets
 from litellm.integrations.custom_logger import CustomLogger
+
+logger = logging.getLogger("AudioGuardrail")
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(logging.Formatter("[AudioGuardrail] %(message)s"))
+    logger.addHandler(h)
 
 
 SRC_RATE = 24000  # OpenAI native sample rate
@@ -48,28 +57,33 @@ class AudioGuardrailHook(CustomLogger):
         BASE_WS_URL = os.getenv("GUARDRAIL_WS_URL", "")
 
         if not BASE_WS_URL:
-            print("[AudioGuardrail] WARNING: GUARDRAIL_WS_URL not set, audio guardrail disabled")
+            logger.info(" WARNING: GUARDRAIL_WS_URL not set, audio guardrail disabled")
             self.guardrail_ws_url = ""
         else:
             separator = "&" if "?" in BASE_WS_URL else "?"
             self.guardrail_ws_url = f"{BASE_WS_URL}{separator}api_key={API_KEY}" if API_KEY else BASE_WS_URL
 
-        print(f"[AudioGuardrail] initialized, input-stream guardrail ready")
+        logger.info(f" initialized, input-stream guardrail ready")
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, **kwargs):
-        """Called by LiteLLM before the realtime WebSocket proxy starts.
+        """No-op: audio guardrail streaming is now handled by FastAPI directly.
 
-        We get the client WebSocket and monkey-patch receive() to intercept
-        input audio and stream it to the guardrail server.
+        Kept registered in litellm_config.yaml for compatibility but does nothing.
+        FastAPI's receive_from_client() handles Gemma WS streaming.
         """
+        return
+
+    async def _do_pre_call(self, data):
         if not self.guardrail_ws_url:
+            logger.info("no guardrail_ws_url, skipping")
             return
 
         client_ws = data.get("websocket")
         if not client_ws:
+            logger.info("no websocket in data, skipping")
             return
 
-        print("[AudioGuardrail] WebSocket intercepted, injecting input audio listener")
+        logger.info("WebSocket intercepted, injecting input audio listener")
 
         original_receive = client_ws.receive
         g_ws = None
@@ -86,22 +100,33 @@ class AudioGuardrailHook(CustomLogger):
                         status = result.get("status")
                         process_time = result.get("process_time_sec", 0)
                         if status == "UNSAFE":
-                            print(f"[AudioGuardrail] UNSAFE detected ({process_time:.2f}s)")
+                            logger.info(f" UNSAFE detected ({process_time:.2f}s)")
                             try:
                                 await client_ws.send_text(json.dumps({
                                     "type": "error",
                                     "error": {
                                         "type": "guardrail_violation",
                                         "code": "audio_guardrail_violation",
-                                        "message": f"輸入音訊不安全 (偵測耗時 {process_time:.2f}s)",
+                                        "message": f"Audio input unsafe ({process_time:.2f}s)",
                                     },
                                 }))
                             except Exception:
                                 pass
                         else:
-                            print(f"[AudioGuardrail] SAFE ({process_time:.2f}s)")
+                            logger.info(f" SAFE ({process_time:.2f}s)")
+                            try:
+                                await client_ws.send_text(json.dumps({
+                                    "type": "error",
+                                    "error": {
+                                        "type": "guardrail_pass",
+                                        "code": "audio_guardrail_safe",
+                                        "message": f"Audio input safe ({process_time:.2f}s)",
+                                    },
+                                }))
+                            except Exception:
+                                pass
             except Exception as e:
-                print(f"[AudioGuardrail] listener stopped: {e}")
+                logger.info(f" listener stopped: {e}")
 
         async def patched_receive():
             nonlocal g_ws
@@ -122,16 +147,16 @@ class AudioGuardrailHook(CustomLogger):
                             if g_ws is None or not is_open:
                                 g_ws = await websockets.connect(self.guardrail_ws_url)
                                 asyncio.create_task(listen_results(g_ws))
-                                print("[AudioGuardrail] WS connected")
+                                logger.info(" WS connected")
 
                             await g_ws.send(resampled)
             except Exception as e:
-                print(f"[AudioGuardrail] intercept error: {e}")
+                logger.info(f" intercept error: {e}")
 
             return msg
 
         client_ws.receive = patched_receive
-        print("[AudioGuardrail] monkey patch applied")
+        logger.info(" monkey patch applied")
 
 
 # LiteLLM loads this instance via callbacks config

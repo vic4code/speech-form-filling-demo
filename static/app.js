@@ -100,16 +100,15 @@ const updateGuardrailInfo = () => {
   fetch("/api/guardrail-info").then(r => r.json()).then(info => {
     const mode = guardrailModeSelect.value;
     const textTarget = info.bedrock_guardrail_id
-      ? `LiteLLM → Bedrock (${info.bedrock_guardrail_id})`
+      ? `Bedrock (${info.bedrock_guardrail_id})`
       : "未設定";
     const lines = [];
     if (mode === "pre_check") {
-      lines.push(`<b>Input:</b> Audio → ${info.audio_ws || "(未設定)"}`);
-      lines.push(`<b>Input (text):</b> Transcript → ${textTarget}`);
+      lines.push(`<b>Input:</b> Audio → Gemma (${info.audio_ws || "未設定"})`);
     } else {
-      lines.push(`<b>Input:</b> Transcript → ${textTarget}`);
+      lines.push(`<b>Input:</b> Transcript → Bedrock (${info.bedrock_guardrail_id || "未設定"})`);
     }
-    lines.push(`<b>Output:</b> Agent transcript → ${textTarget}`);
+    lines.push(`<b>Output:</b> Agent transcript → Bedrock (${info.bedrock_guardrail_id || "未設定"})`);
     guardrailInfoEl.innerHTML = lines.join("&nbsp;&nbsp;|&nbsp;&nbsp;");
     guardrailInfoEl.style.display = "block";
   }).catch(() => { guardrailInfoEl.style.display = "none"; });
@@ -599,6 +598,7 @@ const startConversationRealtime = async () => {
         conversationUserBuffer = "";
       }
       conversationCurrentUser = null;
+      renderChat();
     } else if (data.type === "form_ready") {
       conversationSubmittedPayload = data.payload || null;
       conversationPendingMeta = data.meta || null;

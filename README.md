@@ -15,28 +15,28 @@ After submission, users are redirected to a **Request Log page** with token usag
 
 ```mermaid
 graph LR
-    Browser["🌐 Browser<br/>AudioWorklet"]
-    FastAPI["⚡ FastAPI :8000<br/>應用邏輯 / 表單 / Logs"]
-    LiteLLM["🔀 LiteLLM :4000<br/>AI Proxy + Guardrails"]
-    OpenAI["☁️ OpenAI<br/>Realtime API"]
-    Bedrock["🛡️ Bedrock<br/>Text Guardrail"]
-    AudioGR["🎙️ Audio GR<br/>WS Server"]
+    Browser["Browser\nAudioWorklet"]
+    FastAPI["FastAPI :8000\nApp + Guardrails"]
+    LiteLLM["LiteLLM :4000\nAI Proxy"]
+    OpenAI["OpenAI\nRealtime API"]
+    Gemma["Gemma\nAudio Guardrail"]
+    Bedrock["Bedrock\nText Guardrail"]
 
-    Browser <-->|"WebSocket<br/>audio + events"| FastAPI
+    Browser <-->|"WebSocket\naudio + events"| FastAPI
     FastAPI <-->|"WebSocket"| LiteLLM
     LiteLLM <-->|"Realtime WS"| OpenAI
-    LiteLLM -->|"pre_call"| Bedrock
-    FastAPI -->|"PCM16 stream"| AudioGR
+    FastAPI -->|"PCM16 16kHz\naudio stream"| Gemma
+    FastAPI -.->|"text check\nfail-open"| Bedrock
 
-    style Browser fill:#f0fdf4,stroke:#16a34a
-    style FastAPI fill:#eff6ff,stroke:#2563eb
-    style LiteLLM fill:#fef3c7,stroke:#d97706
-    style Bedrock fill:#fdf2f8,stroke:#be185d
-    style AudioGR fill:#fdf2f8,stroke:#be185d
-    style OpenAI fill:#f5f3ff,stroke:#7c3aed
+    style Browser fill:#f0fdf4,stroke:#16a34a,color:#14532d
+    style FastAPI fill:#eff6ff,stroke:#2563eb,color:#1e3a5f
+    style LiteLLM fill:#fef3c7,stroke:#d97706,color:#78350f
+    style Gemma fill:#fdf2f8,stroke:#be185d,color:#831843
+    style Bedrock fill:#fdf2f8,stroke:#be185d,color:#831843
+    style OpenAI fill:#f5f3ff,stroke:#7c3aed,color:#4c1d95
 ```
 
-> 詳細架構圖、Sequence Diagram 請參考 [ARCHITECTURE.md](ARCHITECTURE.md)
+> For detailed architecture and sequence diagrams, see [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ## Features
 
@@ -50,89 +50,48 @@ When the agent calls `submit_form`, the structured output fills the visual form 
 
 ### Guardrail Integration
 
-Two guardrail modes protect against unsafe or policy-violating content. Both modes share the **same output text guardrail**; they differ only in how **input** is checked.
+Two guardrail modes protect against unsafe or policy-violating content. Both share the **same output text guardrail**; they differ in how **input** is checked.
 
-#### Mode 1: Input Audio Guardrail + Output Text Guardrail
+| | Mode 1 (`pre_check`) | Mode 2 (`post_check`) |
+|---|---|---|
+| **Input check** | Audio stream → Gemma (multimodal model) | Transcript text → Local keywords + Bedrock |
+| **Output check** | Agent transcript → Local keywords + Bedrock | Agent transcript → Local keywords + Bedrock |
+| **Latency** | Low (audio check runs in parallel with transcription) | Medium (text check blocks before AI responds) |
 
-Streams raw audio to an external guardrail WebSocket endpoint (`GUARDRAIL_WS_URL`) for real-time audio-level safety checks.
+#### Mode 1: Audio Input Guardrail (Gemma) + Text Output Guardrail
 
-```
-User Audio ──► Realtime API + stream to Audio Guardrail WS (PCM16, 16kHz)
-                    │                          │
-                    │                    ┌─────┴─────┐
-                    │                    │ SAFE      │ UNSAFE
-                    │                    ▼           ▼
-                    │               Continue    Show warning popup
-                    │                              + stop conversation
-                    ▼
-              Agent Output ──► Output Text Guardrail (pattern check)
-                                    │
-                              ┌─────┴─────┐
-                              │ Pass      │ Block
-                              ▼           ▼
-                         Forward     Show blocked msg
-```
+Audio is streamed in real-time to an external Gemma-based guardrail server via LiteLLM monkey patch. The audio guardrail runs **in parallel** with OpenAI transcription — no added latency.
 
-- Dual-stream: both user input audio and AI output audio are sent to the guardrail server
-- Audio is resampled from 24kHz to 16kHz (numpy linear interpolation) per guardrail server requirements
-- Protocol: binary PCM16 frames sent over WebSocket; server returns `{"event": "guardrail_result", "status": "SAFE"|"UNSAFE"}`
+- Audio resampled from 24kHz → 16kHz (numpy linear interpolation)
+- Protocol: binary PCM16 frames over WebSocket; server returns `{"event": "guardrail_result", "status": "SAFE"|"UNSAFE"}`
+- Implemented via LiteLLM `CustomLogger` callback that monkey-patches `WebSocket.receive()`
 - Based on [DScathay/voice-guardrails](https://github.com/DScathay/voice-guardrails) realtime branch
 
-#### Mode 2: Input Transcript Guardrail + Output Text Guardrail
+#### Mode 2: Transcript Input Guardrail (Text) + Text Output Guardrail
 
-Audio goes directly to Realtime API. The `input_audio_transcription.completed` transcript text is checked via local pattern-based guardrail before triggering AI response.
+Audio goes directly to Realtime API with `create_response: false`. After transcription completes, the transcript is checked via local keyword patterns (+ Bedrock if available) before triggering `response.create`.
 
-```
-User Audio ──► Realtime API (create_response: false)
-                    │
-                    ▼  (transcription completed)
-              Input Text Guardrail (pattern check)
-                    │
-              ┌─────┴─────┐
-              │ Pass      │ Block
-              ▼           ▼
-        response.create   Show warning popup
-              │              + stop conversation
-              ▼
-        Agent Output ──► Output Text Guardrail (pattern check)
-                              │
-                        ┌─────┴─────┐
-                        │ Pass      │ Block
-                        ▼           ▼
-                   Forward     Show blocked msg
-```
-
-- `create_response: false` in `turn_detection` prevents AI from responding before guardrail check completes
-- After guardrail passes, `response.create` is sent manually
+- Pre-flight optimization: guardrail check fires during `transcription.delta` (before completion) to reduce wait time
 - Based on [DScathay/voice-guardrails](https://github.com/DScathay/voice-guardrails) asr branch and [vic4code/realtime-litellm-guardrail](https://github.com/vic4code/realtime-litellm-guardrail)
 
-#### Always-On Text Guardrail
+#### Text Guardrail — Two-Layer Check
 
-Text guardrail runs on **every** user input and AI output, regardless of the Guardrail checkbox. The checkbox only controls Mode 1/2 specific features (audio streaming guardrail).
+All text checks (input in Mode 2, output in both modes) use a two-layer approach:
 
-**Input checking flow:** Bedrock Guardrail → Local Regex Patterns (dual layer)
-**Output checking flow:** Bedrock Guardrail only (to avoid false positives on AI refusal messages)
-
-#### AWS Bedrock Guardrail
-
-Primary text guardrail using AWS Bedrock `ApplyGuardrail` API. Requires `BEDROCK_GUARDRAIL_ID` and valid AWS credentials in `.env`. Falls back to local patterns if unavailable.
-
-#### Local Pattern-Based Guardrail
-
-The built-in text guardrail detects the following categories without any external service:
+1. **Local keyword patterns** (instant, always available) — catches common attack patterns
+2. **AWS Bedrock Guardrail** (optional, fail-open) — semantic understanding for nuanced threats
 
 | Category | Example triggers |
 |---|---|
 | Prompt injection | "ignore previous instructions", "忽略你的指令", "jailbreak", "DAN" |
-| PII / data exfiltration | "API key", "密碼", "列出所有使用者資料" |
-| Abuse / profanity | "幹你娘", "fuck you", "kill yourself" |
-| Violence / crime | "搶劫", "製作炸彈", "殺人", "綁架", "毒品", "賭博" |
-| Code injection | `DROP TABLE`, `<script>`, `UNION SELECT`, `1=1` |
-| Expense fraud | "幫我多報金額", "虛報費用", "不要留下紀錄" |
+| Data exfiltration | "API key", "密碼", "列出所有使用者資料" |
+| Abuse / profanity | "幹你娘", "操你妹", "fuck you", "去死" |
+| Violence / crime | "製作炸彈", "殺人", "綁架", "毒品" |
+| Code injection | `DROP TABLE`, `<script>`, `UNION SELECT` |
+| Expense fraud | "虛報費用", "灌水金額", "不要留下紀錄" |
+| Custom keywords | Set via `GUARDRAIL_BLOCK_KEYWORDS` env var |
 
-When triggered, the conversation shows an inline guardrail message and an orange warning popup (auto-dismiss after 8 seconds).
-
-> For a detailed risk assessment and edge case analysis, see [GUARDRAIL_RISKS.md](GUARDRAIL_RISKS.md).
+> For a detailed risk assessment, see [GUARDRAIL_RISKS.md](GUARDRAIL_RISKS.md).
 
 ### Real-time STT Form Mode
 
@@ -216,7 +175,7 @@ uv run uvicorn app.main:app --reload --port 8000
 - Form page: http://localhost:8000/
 - Request logs: http://localhost:8000/logs.html
 
-Text guardrail runs through LiteLLM → Bedrock. Check the **Guardrail** checkbox for additional audio guardrail features.
+Check the **Guardrail** checkbox to enable input/output safety checks. Select Mode 1 (audio) or Mode 2 (text) for different input guardrail strategies.
 
 ## API Endpoints
 
@@ -226,9 +185,11 @@ Text guardrail runs through LiteLLM → Bedrock. Check the **Guardrail** checkbo
 | `GET` | `/api/requests` | List all submitted requests |
 | `GET` | `/api/requests/:id` | Get single request detail |
 | `DELETE` | `/api/requests/:id` | Delete a request |
+| `DELETE` | `/api/requests` | Delete all requests and events |
 | `GET` | `/api/sessions` | List unified sessions (WS + requests) |
 | `GET` | `/api/ws-sessions` | List WebSocket sessions |
 | `GET` | `/api/ws-sessions/:conn_id/events` | Get events for a WS session |
+| `DELETE` | `/api/ws-sessions/:conn_id` | Delete a WS session and its events |
 | `GET` | `/api/models` | List available Realtime models with pricing |
 | `GET` | `/api/guardrail-info` | Get guardrail endpoint configuration |
 | `POST` | `/api/client-errors` | Log frontend errors |
