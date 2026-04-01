@@ -12,8 +12,8 @@ graph TB
     subgraph App["FastAPI :8000"]
         Proxy["WebSocket Proxy"]
         Logic["App Logic\nForm / Tool Calling"]
-        LocalGR["Local Keyword\nGuardrail"]
-        GemmaStream["Gemma Audio\nStreaming"]
+        LocalGR["Local Keyword Guardrail"]
+        GemmaStream["Gemma Audio Streaming"]
         DB["SQLite\nLogs / Tokens / Cost"]
     end
 
@@ -22,26 +22,16 @@ graph TB
         BedrockHook["Bedrock Guardrail\npre_call hook"]
     end
 
-    subgraph RealtimeAPI["OpenAI Realtime API (single WebSocket)"]
-        GPT4o["GPT-4o\nConversation + TTS"]
-        VAD["Server VAD\nSpeech Detection"]
-        Transcribe["gpt-4o-transcribe\nInput Transcription"]
-    end
-
-    subgraph ExternalGR["External Guardrail Services"]
-        Bedrock["AWS Bedrock\nText Guardrail\n(optional, fail-open)"]
-        Gemma["Gemma\nAudio Guardrail\nWS Server"]
-    end
+    OpenAI["OpenAI Realtime API\nGPT-4o + Server VAD\n+ gpt-4o-transcribe\n(single WebSocket)"]
+    Bedrock["AWS Bedrock Guardrail\n(optional, fail-open)"]
+    Gemma["Gemma Audio Guardrail\nWS Server"]
 
     UI <-->|"WebSocket\naudio + events"| Proxy
     AW -->|"PCM16 base64"| Proxy
     Proxy <-->|"WebSocket"| Router
     GemmaStream -->|"PCM16 16kHz\nreal-time stream"| Gemma
 
-    Router <-->|"single Realtime WS"| GPT4o
-    VAD -->|"speech_started\nspeech_stopped"| GPT4o
-    VAD -->|"audio segments"| Transcribe
-    Transcribe -->|"transcription.delta\ntranscription.completed"| Router
+    Router <-->|"Realtime WS"| OpenAI
 
     LocalGR -.->|"Bedrock check\n(if available)"| BedrockHook
     BedrockHook -.->|"ApplyGuardrail API"| Bedrock
@@ -52,8 +42,9 @@ graph TB
     style Browser fill:#f0fdf4,stroke:#16a34a,color:#14532d
     style App fill:#eff6ff,stroke:#2563eb,color:#1e3a5f
     style Proxy_LLM fill:#fef3c7,stroke:#d97706,color:#78350f
-    style RealtimeAPI fill:#f5f3ff,stroke:#7c3aed,color:#4c1d95
-    style ExternalGR fill:#fdf2f8,stroke:#be185d,color:#831843
+    style OpenAI fill:#f5f3ff,stroke:#7c3aed,color:#4c1d95
+    style Bedrock fill:#fdf2f8,stroke:#be185d,color:#831843
+    style Gemma fill:#fdf2f8,stroke:#be185d,color:#831843
 ```
 
 ### OpenAI Realtime API — Internal Components
@@ -64,7 +55,7 @@ All processing happens within a **single WebSocket connection**. No separate API
 |-----------|------|--------|
 | **Server VAD** | Detects speech start/end, segments audio | `speech_started`, `speech_stopped`, `committed` |
 | **gpt-4o-transcribe** | Transcribes segmented audio to text | `transcription.delta`, `transcription.completed` |
-| **GPT-4o** | Understands context, generates response + TTS | `response.audio.delta`, `response.audio_transcript.delta` |
+| **GPT-4o** | Understands context, generates text + audio response natively | `response.audio.delta`, `response.audio_transcript.delta` |
 
 Configured via `session.update`:
 ```json
@@ -174,7 +165,7 @@ sequenceDiagram
     LiteLLM ->> OpenAI: response.create
 
     rect rgb(245, 243, 255)
-        note over OpenAI: GPT-4o generates response + TTS
+        note over OpenAI: GPT-4o generates response + audio
         OpenAI -->> FastAPI: response.audio.delta (streaming)
         OpenAI -->> FastAPI: response.audio_transcript.done
     end
@@ -272,7 +263,7 @@ PASSED
 | **LiteLLM** (:4000) | AI proxy | Model routing, Bedrock guardrail pre_call hook |
 | **Gemma WS Server** | External WS | Audio-level safety (multimodal Gemma model) |
 | **Bedrock Guardrail** | External API | Text safety — semantic understanding (optional, fail-open) |
-| **OpenAI Realtime API** | External service | Speech understanding, AI conversation, TTS |
+| **OpenAI Realtime API** | External service | Speech understanding, AI conversation, native audio output |
 
 ---
 
