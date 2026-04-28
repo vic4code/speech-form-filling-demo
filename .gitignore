@@ -5,3 +5,4 @@ app/__pycache__/
 app/requests.db
 *.pyc
 *.log
+.browser_data/

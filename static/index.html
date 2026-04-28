@@ -3,232 +3,59 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Speech Form Filling</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260330a" />
+    <title>語音填表 Demo</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260428a" />
   </head>
   <body>
     <header class="mobile-header">
       <div class="header-bar">
         <button class="icon-button" aria-label="返回">←</button>
-        <h1>表單填寫</h1>
-        <div class="header-spacer"></div>
+        <h1>語音填表 Demo</h1>
+        <a class="tab-button" href="/logs.html" style="font-size:12px">查看紀錄</a>
       </div>
     </header>
 
     <main class="container narrow">
-      <div class="tabs">
-        <button class="tab-button active" data-tab="conversation">Conversation 模式</button>
-        <button class="tab-button" data-tab="stt">Real-time STT 模式</button>
-        <a class="tab-button" href="/logs.html">查看紀錄</a>
+      <!-- ── Guardrail warning popup ── -->
+      <div id="guardrail-warning" class="guardrail-warning hidden">
+        <strong>Guardrail：</strong>
+        <span id="guardrail-warning-msg"></span>
+        <button class="btn-dismiss" onclick="this.parentElement.classList.add('hidden')">&times;</button>
       </div>
 
-      <section class="card" id="stt-tab">
-        <div class="section-title"><span>🎙️</span>即時 STT 填單模式</div>
-        <p class="status">
-          <span class="status-dot" id="stt-status-dot"></span>
-          <span id="stt-status-text">等待開始語音</span>
-          <span class="badge" id="stt-active-field">欄位：乘坐日期</span>
-        </p>
-
-        <div class="inline-actions">
-          <button class="button" id="stt-start">開始語音</button>
-          <button class="button secondary" id="stt-stop">停止語音</button>
-          <button class="button secondary" id="stt-prev">上一個欄位</button>
-          <button class="button secondary" id="stt-next">下一個欄位</button>
+      <!-- ── Voice control bar ── -->
+      <div class="conv-voice-bar card">
+        <div class="conv-voice-bar-left">
+          <span class="status-dot" id="conversation-status-dot"></span>
+          <span id="conversation-status-text" class="conv-voice-label">等待開始語音</span>
+          <button class="button" id="conversation-start">開始語音</button>
+          <button class="button secondary" id="conversation-stop">停止語音</button>
         </div>
-
-        <div class="card" style="margin-top: 20px">
-          <div class="section-title"><span>二</span>乘坐日期</div>
-          <div class="field">
-            <label>乘坐日期</label>
-            <input id="field-date" type="date" />
-          </div>
+        <div class="conv-voice-bar-right">
+          <select id="model-select" class="model-select" title="選擇模型"></select>
+          <label class="guardrail-toggle">
+            <input type="checkbox" id="guardrail-enabled" />
+            <span>Guardrail</span>
+          </label>
         </div>
+      </div>
+      <div id="guardrail-info" class="guardrail-info" style="display:none"></div>
 
-        <div class="card" style="margin-top: 20px">
-          <div class="section-title"><span>三</span>乘坐類型</div>
-          <div class="field">
-            <label>乘坐類型</label>
-            <select id="field-ride-type">
-              <option value="">請選擇</option>
-              <option>01_單日單趟</option>
-              <option>02_單日來回</option>
-              <option>03_單日多趟(請於備註說明)</option>
-            </select>
-          </div>
-          <p class="hint">提醒：使用企業簽單者，請勿重複申請計程車資。</p>
+      <!-- ── Chat panel (full width) ── -->
+      <div class="card conv-chat-card-full" style="margin-top: 16px;">
+        <div class="section-title text-only"><span>對話紀錄</span></div>
+        <div class="chat" id="chat"></div>
+        <div class="conv-chat-input">
+          <input id="chat-input" placeholder="輸入訊息…" />
+          <button class="button" id="chat-send">送出</button>
         </div>
+      </div>
 
-        <div class="card" style="margin-top: 20px">
-          <div class="section-title"><span>四</span>乘坐起迄地點</div>
-          <div class="ride-header">
-            <span>乘坐起點</span>
-            <span>乘坐迄點</span>
-            <span>費用</span>
-            <span>乘坐事由</span>
-            <span class="ride-remove">移除</span>
-          </div>
-          <div id="ride-rows"></div>
-          <button class="button ghost" id="add-ride">＋ 新增一列</button>
-        </div>
+      <!-- ── Browser fill status ── -->
+      <div id="browser-status" class="browser-status" style="display:none">
+        <span id="browser-status-text"></span>
+      </div>
 
-        <div class="card" style="margin-top: 20px">
-          <div class="section-title"><span>五</span>當日車資合計</div>
-          <div class="field">
-            <label>車資合計</label>
-            <input id="field-total" type="number" placeholder="請輸入" />
-          </div>
-        </div>
-
-        <div class="card" style="margin-top: 20px">
-          <div class="section-title"><span>六</span>備註說明</div>
-          <div class="field">
-            <label>備註說明</label>
-            <textarea id="field-notes" placeholder="請輸入"></textarea>
-          </div>
-        </div>
-
-        <div class="card" style="margin-top: 20px">
-          <div class="section-title"><span>✅</span>審批流程</div>
-          <div class="approval-item">
-            <div>
-              <strong>申請人</strong>
-              <p>人工智慧科技科・陳奕惟</p>
-            </div>
-            <span class="approval-status">未提交</span>
-          </div>
-          <div class="approval-item">
-            <div>
-              <strong>專案經理</strong>
-              <p>數位數據暨科技發展中心數據暨人工智慧發展部・謝昌宏</p>
-            </div>
-            <span class="approval-status">--</span>
-          </div>
-        </div>
-
-        <div class="footer-actions">
-          <button class="button secondary" id="stt-review">暫存表單</button>
-          <button class="button primary" id="stt-submit">提交表單</button>
-        </div>
-        <span class="status" id="stt-submit-status"></span>
-      </section>
-
-      <section id="conversation-tab" style="display: none">
-        <!-- ── Guardrail warning popup (like voice-guardrails reference) ── -->
-        <div id="guardrail-warning" class="guardrail-warning hidden">
-          <strong>⚠️ Guardrail 攔截：</strong>
-          <span id="guardrail-warning-msg"></span>
-          <button class="btn-dismiss" onclick="this.parentElement.classList.add('hidden')">&times;</button>
-        </div>
-
-        <!-- ── Voice control bar ── -->
-        <div class="conv-voice-bar card">
-          <div class="conv-voice-bar-left">
-            <span class="status-dot" id="conversation-status-dot"></span>
-            <span id="conversation-status-text" class="conv-voice-label">等待開始語音</span>
-            <button class="button" id="conversation-start">開始語音</button>
-            <button class="button secondary" id="conversation-stop">停止語音</button>
-          </div>
-          <div class="conv-voice-bar-right">
-            <select id="model-select" class="model-select" title="選擇模型"></select>
-            <label class="guardrail-toggle">
-              <input type="checkbox" id="guardrail-enabled" />
-              <span>Guardrail（關鍵字）</span>
-            </label>
-          </div>
-        </div>
-        <!-- Guardrail endpoint info (shown when enabled) -->
-        <div id="guardrail-info" class="guardrail-info" style="display:none"></div>
-        <div id="guardrail-status" class="guardrail-status" style="display:none"></div>
-
-        <div class="conversation-layout">
-          <!-- ── Main: Form (primary) ── -->
-          <div class="conversation-form-panel">
-            <div class="card">
-              <div class="section-title"><span>📋</span>計程車費報銷表單</div>
-
-              <div class="card inner-card">
-                <div class="section-title"><span>二</span>乘坐日期</div>
-                <div class="field">
-                  <label>乘坐日期</label>
-                  <input id="conv-field-date" type="date" />
-                </div>
-              </div>
-
-              <div class="card inner-card">
-                <div class="section-title"><span>三</span>乘坐類型</div>
-                <div class="field">
-                  <label>乘坐類型</label>
-                  <select id="conv-field-ride-type">
-                    <option value="">請選擇</option>
-                    <option>01_單日單趟</option>
-                    <option>02_單日來回</option>
-                    <option>03_單日多趟(請於備註說明)</option>
-                  </select>
-                </div>
-              </div>
-
-              <div class="card inner-card">
-                <div class="section-title"><span>四</span>乘坐起迄地點</div>
-                <div class="conv-ride-header">
-                  <span>起點</span><span>迄點</span><span>費用</span><span>事由</span>
-                </div>
-                <div id="conv-ride-rows"></div>
-              </div>
-
-              <div class="card inner-card">
-                <div class="section-title"><span>五</span>當日車資合計</div>
-                <div class="field">
-                  <label>車資合計</label>
-                  <input id="conv-field-total" type="number" placeholder="請輸入" />
-                </div>
-              </div>
-
-              <div class="card inner-card">
-                <div class="section-title"><span>六</span>備註說明</div>
-                <div class="field">
-                  <label>備註說明</label>
-                  <textarea id="conv-field-notes" placeholder="請輸入"></textarea>
-                </div>
-              </div>
-
-              <div class="card inner-card">
-                <div class="section-title"><span>✅</span>審批流程</div>
-                <div class="approval-item">
-                  <div><strong>申請人</strong><p>人工智慧科技科・陳奕惟</p></div>
-                  <span class="approval-status" id="conv-approval-status">未提交</span>
-                </div>
-                <div class="approval-item">
-                  <div><strong>專案經理</strong><p>數位數據暨科技發展中心數據暨人工智慧發展部・謝昌宏</p></div>
-                  <span class="approval-status">--</span>
-                </div>
-              </div>
-
-              <div class="footer-actions">
-                <button class="button secondary" id="generate-structure">重新產生</button>
-                <button class="button primary" id="conversation-submit">送出申請</button>
-              </div>
-              <span class="status" id="conversation-status"></span>
-            </div>
-          </div>
-
-          <!-- ── Sidebar: Chat + Structured Output ── -->
-          <div class="conversation-chat-panel">
-            <div class="card conv-chat-card">
-              <div class="section-title text-only"><span>💬 對話紀錄</span></div>
-              <div class="chat" id="chat"></div>
-              <div class="conv-chat-input">
-                <input id="chat-input" placeholder="輸入訊息…" />
-                <button class="button" id="chat-send">送出</button>
-              </div>
-            </div>
-            <div class="card conv-structured-card">
-              <div class="section-title text-only"><span>📄 Structured Output</span></div>
-              <textarea id="structured-output" class="conv-structured-output" rows="10" placeholder="Structured Output（對話完成後自動產生）"></textarea>
-            </div>
-          </div>
-        </div>
-      </section>
       <details id="session-debug-panel" hidden style="margin-top: 16px; padding: 0 16px 16px">
         <summary style="cursor: pointer; font-size: 13px; color: #6b7280; padding: 4px 0;">
           Session Debug Log
@@ -242,9 +69,6 @@
       </details>
     </main>
 
-    <button class="floating-prev" id="stt-prev-floating">上一個欄位</button>
-    <button class="floating-next" id="stt-next-floating">下一個欄位</button>
-
-    <script src="/static/app.js?v=20260330a"></script>
+    <script src="/static/app.js?v=20260428a"></script>
   </body>
 </html>

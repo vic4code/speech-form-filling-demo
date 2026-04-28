@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 import websockets
 
 from app.guardrails import check_text_local
+from app.browser import connect_and_fill
 
 
 load_dotenv()
@@ -578,13 +579,18 @@ def get_request(request_id: str) -> RequestRecord:
 SUBMIT_FORM_TOOL = {
     "type": "function",
     "name": "submit_form",
-    "description": "當所有欄位完整時，送出計程車費報銷表單。rideDate 和 rideType 為必填，不可為空。",
+    "description": "當所有欄位完整時，送出計程車費報銷表單。所有必填欄位都確認後才能呼叫。",
     "parameters": {
         "type": "object",
         "properties": {
+            "ridePeriod": {
+                "type": "string",
+                "enum": ["01_平日(08~21)", "02_平日(22~07)", "03_假日"],
+                "description": "乘車時段，根據使用者描述判斷：平日白天=01、平日晚上=02、假日=03。若未提及預設為 01_平日(08~21)。",
+            },
             "rideDate": {
                 "type": "string",
-                "description": "乘坐日期，格式必須為 YYYY-MM-DD，例如 2026-03-27。若使用者未提供，請先詢問。",
+                "description": "乘坐日期，格式必須為 YYYY-MM-DD，例如 2026-04-28。若使用者未提供，請先詢問。",
             },
             "rideType": {
                 "type": "string",
@@ -608,7 +614,7 @@ SUBMIT_FORM_TOOL = {
             "totalFare": {"type": "string", "description": "當日車資合計（數字）"},
             "notes": {"type": "string", "description": "備註說明，可為空字串"},
         },
-        "required": ["rideDate", "rideType", "rideRows", "totalFare", "notes"],
+        "required": ["ridePeriod", "rideDate", "rideType", "rideRows", "totalFare", "notes"],
     },
 }
 
@@ -883,6 +889,7 @@ async def realtime_proxy(client_ws: WebSocket):
                                         "submittedAt": now_iso(),
                                         "durationMs": duration_ms,
                                     }
+                                # Notify frontend that form data is ready
                                 await safe_send(
                                     {
                                         "type": "form_ready",
@@ -890,6 +897,22 @@ async def realtime_proxy(client_ws: WebSocket):
                                         "meta": meta.model_dump() if meta else None,
                                     }
                                 )
+
+                                # Fill the real browser form via Playwright CDP
+                                result = await connect_and_fill(form_payload)
+                                if result == "ok":
+                                    await safe_send({"type": "browser_fill_done"})
+                                    tool_output = {
+                                        "status": "success",
+                                        "message": "已自動填入瀏覽器表單，請使用者確認後提交。",
+                                    }
+                                else:
+                                    await safe_send({"type": "browser_fill_error", "message": result})
+                                    tool_output = {
+                                        "status": "error",
+                                        "message": f"自動填表失敗：{result}",
+                                    }
+
                                 await ws_send(
                                     openai_ws,
                                     {
@@ -897,15 +920,12 @@ async def realtime_proxy(client_ws: WebSocket):
                                         "item": {
                                             "type": "function_call_output",
                                             "call_id": call_id,
-                                            "output": json.dumps({
-                                                "status": "pending_user_confirmation",
-                                                "message": "已整理表單，等待使用者確認送出。",
-                                            }),
+                                            "output": json.dumps(tool_output),
                                         },
                                     },
                                     logger,
                                 )
-                                # After function call output, always trigger AI to confirm
+                                # After function call output, trigger AI to confirm
                                 _response_active = False
                                 await ws_send(openai_ws, {"type": "response.create"}, logger)
                             except Exception as exc:

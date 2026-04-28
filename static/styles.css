@@ -824,6 +824,50 @@ textarea {
   max-height: 600px;
 }
 
+/* Chat card: full-width standalone mode */
+.conv-chat-card-full {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 240px);
+  min-height: 400px;
+  max-height: 700px;
+}
+
+.conv-chat-card-full .chat {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Browser fill status */
+.browser-status {
+  margin-top: 12px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.browser-status.info {
+  background: rgba(59, 130, 246, 0.1);
+  color: #1d4ed8;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+.browser-status.success {
+  background: rgba(33, 179, 107, 0.1);
+  color: var(--accent-dark);
+  border: 1px solid rgba(33, 179, 107, 0.3);
+}
+
+.browser-status.error {
+  background: rgba(239, 68, 68, 0.1);
+  color: #b91c1c;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
 .conv-chat-card .chat {
   flex: 1;
   min-height: 0;
