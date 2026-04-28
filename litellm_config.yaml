@@ -20,26 +20,5 @@ model_list:
     model_info:
       mode: realtime
 
-  # Text model for guardrail pre_call checks
-  - model_name: openai/gpt-4o-mini
-    litellm_params:
-      model: openai/gpt-4o-mini
-      api_key: os.environ/OPENAI_API_KEY
-
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
-
-# Audio Guardrail: monkey-patches realtime WebSocket to stream audio to guardrail server
-litellm_settings:
-  callbacks:
-    - audio_guardrail.audio_guardrail_instance
-
-# Text Guardrail: Bedrock endpoint via pre_call hook
-guardrails:
-  - guardrail_name: bedrock-text-guardrail
-    litellm_params:
-      guardrail: bedrock
-      guardrailIdentifier: os.environ/BEDROCK_GUARDRAIL_ID
-      guardrailVersion: os.environ/BEDROCK_GUARDRAIL_VERSION
-      mode: pre_call
-      default_on: false

@@ -71,8 +71,7 @@ const renderSessions = (items) => {
       ? `<span class="badge">${s.req_mode.toUpperCase()}</span>`
       : "";
     const grModeLabels = {
-      pre_check: "Audio + Text Guardrail",
-      post_check: "Text Guardrail",
+      keyword: "關鍵字 Guardrail",
     };
     const grMode = s.guardrail_mode;
     const grBadge = grMode

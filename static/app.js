@@ -86,7 +86,6 @@ const modelSelect = document.getElementById("model-select");
 
 // Guardrail state
 const guardrailEnabled = document.getElementById("guardrail-enabled");
-const guardrailModeSelect = document.getElementById("guardrail-mode");
 const guardrailStatusEl = document.getElementById("guardrail-status");
 const guardrailWarningEl = document.getElementById("guardrail-warning");
 const guardrailWarningMsg = document.getElementById("guardrail-warning-msg");
@@ -98,26 +97,12 @@ const updateGuardrailInfo = () => {
     return;
   }
   fetch("/api/guardrail-info").then(r => r.json()).then(info => {
-    const mode = guardrailModeSelect.value;
-    const textTarget = info.bedrock_guardrail_id
-      ? `Bedrock (${info.bedrock_guardrail_id})`
-      : "未設定";
-    const lines = [];
-    if (mode === "pre_check") {
-      lines.push(`<b>Input:</b> Audio → Gemma (${info.audio_ws || "未設定"})`);
-    } else {
-      lines.push(`<b>Input:</b> Transcript → Bedrock (${info.bedrock_guardrail_id || "未設定"})`);
-    }
-    lines.push(`<b>Output:</b> Agent transcript → Bedrock (${info.bedrock_guardrail_id || "未設定"})`);
-    guardrailInfoEl.innerHTML = lines.join("&nbsp;&nbsp;|&nbsp;&nbsp;");
+    guardrailInfoEl.innerHTML = `<b>Guardrail:</b> ${info.description}`;
     guardrailInfoEl.style.display = "block";
   }).catch(() => { guardrailInfoEl.style.display = "none"; });
 };
 
-guardrailModeSelect.addEventListener("change", updateGuardrailInfo);
-
 guardrailEnabled.addEventListener("change", () => {
-  guardrailModeSelect.classList.toggle("visible", guardrailEnabled.checked);
   guardrailStatusEl.className = "guardrail-status";
   guardrailStatusEl.textContent = "";
   updateGuardrailInfo();
@@ -546,7 +531,7 @@ const startConversationRealtime = async () => {
   const params = new URLSearchParams();
   params.set("model", modelSelect.value);
   if (guardrailEnabled.checked) {
-    params.set("guardrail", guardrailModeSelect.value);
+    params.set("guardrail", "keyword");
   }
   let wsUrl = `${wsProtocol}://${window.location.host}/ws/realtime?${params.toString()}`;
   conversationSocket = new WebSocket(wsUrl);
@@ -1022,7 +1007,7 @@ const submitRequest = async (mode, payload, statusEl) => {
         payload,
         meta,
         connId: _wsConnId,
-        guardrailMode: guardrailEnabled.checked ? guardrailModeSelect.value : null,
+        guardrailMode: guardrailEnabled.checked ? "keyword" : null,
       }),
     });
     if (!response.ok) {

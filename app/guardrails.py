@@ -1,25 +1,12 @@
 """Guardrail module.
 
-Text Guardrail: Local keyword patterns + LiteLLM → Bedrock (if available)
-Audio Guardrail: LiteLLM → AudioGuardrailHook (monkey patch via callbacks config)
+Local keyword pattern matching for content safety checks.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
-from typing import Any
-
-
-@dataclass
-class GuardrailResult:
-    passed: bool
-    check_type: str  # "input_audio" | "input_text" | "output_text"
-    message: str = ""
-    detail: dict[str, Any] = field(default_factory=dict)
-
-
 # ── Local keyword-based guardrail ──
 
 _BLOCK_PATTERNS: list[tuple[str, re.Pattern]] = [
