@@ -3,72 +3,80 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>語音填表 Demo</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260428a" />
+    <title>語音填表</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260506b" />
   </head>
-  <body>
-    <header class="mobile-header">
-      <div class="header-bar">
-        <button class="icon-button" aria-label="返回">←</button>
-        <h1>語音填表 Demo</h1>
-        <a class="tab-button" href="/logs.html" style="font-size:12px">查看紀錄</a>
+  <body class="ck-body">
+    <header class="ck-app-header">
+      <div class="ck-app-header-inner">
+        <span class="ck-app-title">語音填表</span>
+        <a class="ck-link-quiet" href="/logs.html">紀錄 ↗</a>
       </div>
     </header>
 
-    <main class="container narrow">
-      <!-- ── Guardrail warning popup ── -->
-      <div id="guardrail-warning" class="guardrail-warning hidden">
-        <strong>Guardrail：</strong>
-        <span id="guardrail-warning-msg"></span>
-        <button class="btn-dismiss" onclick="this.parentElement.classList.add('hidden')">&times;</button>
-      </div>
-
-      <!-- ── Voice control bar ── -->
-      <div class="conv-voice-bar card">
-        <div class="conv-voice-bar-left">
-          <span class="status-dot" id="conversation-status-dot"></span>
-          <span id="conversation-status-text" class="conv-voice-label">等待開始語音</span>
-          <button class="button" id="conversation-start">開始語音</button>
-          <button class="button secondary" id="conversation-stop">停止語音</button>
+    <main class="ck-main">
+      <!-- ── Settings: form is the loud one, the rest are quiet pills ── -->
+      <div class="ck-settings">
+        <div class="ck-settings-primary">
+          <span class="ck-eyebrow">正在填寫</span>
+          <select id="form-select" class="ck-select-primary" title="選擇要填寫的表單"></select>
+          <a id="form-link" target="_blank" rel="noopener" class="ck-link-quiet">原始表單 ↗</a>
         </div>
-        <div class="conv-voice-bar-right">
-          <select id="model-select" class="model-select" title="選擇模型"></select>
-          <label class="guardrail-toggle">
+        <div class="ck-settings-secondary">
+          <select id="model-select" class="ck-pill-select" title="選擇模型"></select>
+          <label class="ck-toggle-pill">
             <input type="checkbox" id="guardrail-enabled" />
             <span>Guardrail</span>
           </label>
         </div>
       </div>
-      <div id="guardrail-info" class="guardrail-info" style="display:none"></div>
 
-      <!-- ── Chat panel (full width) ── -->
-      <div class="card conv-chat-card-full" style="margin-top: 16px;">
-        <div class="section-title text-only"><span>對話紀錄</span></div>
-        <div class="chat" id="chat"></div>
-        <div class="conv-chat-input">
-          <input id="chat-input" placeholder="輸入訊息…" />
-          <button class="button" id="chat-send">送出</button>
-        </div>
+      <!-- Guardrail warning toast -->
+      <div id="guardrail-warning" class="ck-toast hidden">
+        <strong>Guardrail：</strong>
+        <span id="guardrail-warning-msg"></span>
+        <button class="ck-toast-close" onclick="this.parentElement.classList.add('hidden')">×</button>
       </div>
+      <div id="guardrail-info" class="ck-info-row" style="display:none"></div>
 
-      <!-- ── Browser fill status ── -->
-      <div id="browser-status" class="browser-status" style="display:none">
+      <!-- Browser fill status chip -->
+      <div id="browser-status" class="ck-status-chip" style="display:none">
         <span id="browser-status-text"></span>
       </div>
 
-      <details id="session-debug-panel" hidden style="margin-top: 16px; padding: 0 16px 16px">
-        <summary style="cursor: pointer; font-size: 13px; color: #6b7280; padding: 4px 0;">
-          Session Debug Log
-        </summary>
-        <div id="session-debug-list" style="
-          margin-top: 8px; display: flex; flex-direction: column; gap: 6px;
-          font-size: 12px; font-family: monospace; background: #0f172a;
-          color: #e2e8f0; border-radius: 10px; padding: 10px 12px;
-          max-height: 200px; overflow-y: auto;
-        "></div>
+      <!-- Chat -->
+      <section class="ck-chat-wrapper">
+        <div class="chat ck-chat" id="chat"></div>
+      </section>
+
+      <details id="session-debug-panel" hidden class="ck-debug">
+        <summary>Session Debug Log</summary>
+        <div id="session-debug-list" class="ck-debug-list"></div>
       </details>
     </main>
 
-    <script src="/static/app.js?v=20260428a"></script>
+    <!-- Sticky composer -->
+    <footer class="ck-composer">
+      <div class="ck-composer-inner">
+        <div class="ck-composer-status">
+          <span class="ck-status-dot" id="conversation-status-dot"></span>
+          <span id="conversation-status-text" class="ck-status-text">尚未連線</span>
+        </div>
+        <div class="ck-composer-row">
+          <button class="ck-mic-btn" id="conversation-start" title="開始語音" aria-label="開始語音">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="22"/></svg>
+          </button>
+          <button class="ck-mic-btn ck-mic-stop" id="conversation-stop" title="停止語音" aria-label="停止語音">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+          </button>
+          <input id="chat-input" class="ck-composer-input" placeholder="輸入訊息，或按麥克風開始語音…" />
+          <button class="ck-send-btn" id="chat-send" title="送出" aria-label="送出">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+          </button>
+        </div>
+      </div>
+    </footer>
+
+    <script src="/static/app.js?v=20260506b"></script>
   </body>
 </html>

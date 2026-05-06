@@ -22,7 +22,9 @@ from dotenv import load_dotenv
 import websockets
 
 from app.guardrails import check_text_local
-from app.browser import connect_and_fill
+from app.browser import open_form_page
+from app.forms import get_skill, has_skill, list_skills
+from app.profile import get_current_profile
 
 
 load_dotenv()
@@ -576,47 +578,12 @@ def get_request(request_id: str) -> RequestRecord:
     raise HTTPException(status_code=404, detail="Request not found")
 
 
-SUBMIT_FORM_TOOL = {
-    "type": "function",
-    "name": "submit_form",
-    "description": "當所有欄位完整時，送出計程車費報銷表單。所有必填欄位都確認後才能呼叫。",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "ridePeriod": {
-                "type": "string",
-                "enum": ["01_平日(08~21)", "02_平日(22~07)", "03_假日"],
-                "description": "乘車時段，根據使用者描述判斷：平日白天=01、平日晚上=02、假日=03。若未提及預設為 01_平日(08~21)。",
-            },
-            "rideDate": {
-                "type": "string",
-                "description": "乘坐日期，格式必須為 YYYY-MM-DD，例如 2026-04-28。若使用者未提供，請先詢問。",
-            },
-            "rideType": {
-                "type": "string",
-                "enum": ["01_單日單趟", "02_單日來回", "03_單日多趟(請於備註說明)"],
-                "description": "乘坐類型，必須為以下三選一：01_單日單趟、02_單日來回、03_單日多趟(請於備註說明)。根據使用者描述的趟數判斷。",
-            },
-            "rideRows": {
-                "type": "array",
-                "description": "乘坐起迄明細，至少一筆",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "from": {"type": "string", "description": "乘坐起點"},
-                        "to": {"type": "string", "description": "乘坐迄點"},
-                        "fee": {"type": "string", "description": "費用（數字）"},
-                        "reason": {"type": "string", "description": "乘坐事由"},
-                    },
-                    "required": ["from", "to", "fee", "reason"],
-                },
-            },
-            "totalFare": {"type": "string", "description": "當日車資合計（數字）"},
-            "notes": {"type": "string", "description": "備註說明，可為空字串"},
-        },
-        "required": ["ridePeriod", "rideDate", "rideType", "rideRows", "totalFare", "notes"],
-    },
-}
+DEFAULT_FORM_ID = os.getenv("DEFAULT_FORM_ID", "taxi")
+
+
+@app.get("/api/forms")
+def api_list_forms() -> list[dict[str, Any]]:
+    return [skill.public_meta() for skill in list_skills()]
 
 
 @app.websocket("/ws/realtime")
@@ -630,6 +597,19 @@ async def realtime_proxy(client_ws: WebSocket):
     # Parse query params
     guardrail_on = client_ws.query_params.get("guardrail") == "keyword"
     selected_model = client_ws.query_params.get("model", DEFAULT_REALTIME_MODEL)
+    form_id = client_ws.query_params.get("form") or DEFAULT_FORM_ID
+    if not has_skill(form_id):
+        await client_ws.send_json({
+            "type": "error",
+            "message": f"未知的表單代號：{form_id}",
+        })
+        await client_ws.close()
+        return
+    skill = get_skill(form_id)
+    profile = get_current_profile()
+    instructions_with_profile = (
+        profile.as_prompt_block() + "\n\n" + skill.instructions
+    )
 
     headers = {"Authorization": f"Bearer {LITELLM_MASTER_KEY}"}
 
@@ -663,24 +643,7 @@ async def realtime_proxy(client_ws: WebSocket):
                 "session": {
                     "modalities": ["text", "audio"],
                     "output_audio_format": "pcm16",
-                    "instructions": (
-                        "你是計程車費報銷表單助理。請用繁體中文對話引導使用者完成表單。\n"
-                        "回覆請簡短扼要，每次回覆不超過兩句話。\n\n"
-                        "必填欄位（缺一不可，全部確認才能送出）：\n"
-                        "1. 乘坐日期（格式 YYYY-MM-DD，必須問清楚具體日期）\n"
-                        "2. 乘坐類型（單趟=01_單日單趟，來回=02_單日來回，多趟=03_單日多趟）\n"
-                        "3. 每趟的起點、迄點、費用、事由（全部都要有值）\n"
-                        "4. 車資合計\n\n"
-                        "重要規則：\n"
-                        "- 絕對不可以在資訊不完整時呼叫 submit_form\n"
-                        "- 逐一確認每個欄位，缺少的欄位務必追問\n"
-                        "- 若使用者沒提到日期，追問「請問是哪一天搭乘的？」\n"
-                        "- 若使用者沒提到費用，追問「這趟費用是多少？」\n"
-                        "- 若使用者沒提到事由，追問「搭乘的事由是什麼？」\n"
-                        "- 所有欄位都確認完畢、使用者也同意後，才呼叫 submit_form\n"
-                        "- 日期格式必須是 YYYY-MM-DD\n"
-                        "- rideType 必須是 01_單日單趟、02_單日來回、03_單日多趟(請於備註說明) 三選一"
-                    ),
+                    "instructions": instructions_with_profile,
                     "input_audio_format": "pcm16",
                     "input_audio_transcription": {
                         "model": OPENAI_TRANSCRIBE_MODEL,
@@ -696,7 +659,7 @@ async def realtime_proxy(client_ws: WebSocket):
                         "prefix_padding_ms": 400,
                         "silence_duration_ms": 1000,
                     },
-                    "tools": [SUBMIT_FORM_TOOL],
+                    "tools": [skill.tool_schema()],
                     "tool_choice": "auto",
                 },
             }
@@ -712,6 +675,10 @@ async def realtime_proxy(client_ws: WebSocket):
             _total_output_tokens = 0
             _total_audio_input_tokens = 0
             _total_audio_output_tokens = 0
+            # Output guardrail: per-response transcript buffer + blocked flag
+            _agent_buffer = ""
+            _agent_blocked = False
+            _agent_passed_emitted = False
             async def receive_from_client():
                 nonlocal client_started_at, audio_samples_total
                 try:
@@ -761,6 +728,7 @@ async def realtime_proxy(client_ws: WebSocket):
             async def receive_from_openai():
                 nonlocal _response_active, _total_input_tokens, _total_output_tokens
                 nonlocal _total_audio_input_tokens, _total_audio_output_tokens
+                nonlocal _agent_buffer, _agent_blocked, _agent_passed_emitted
 
                 try:
                     async for raw in openai_ws:
@@ -780,21 +748,63 @@ async def realtime_proxy(client_ws: WebSocket):
 
                         if event_type == "response.created":
                             _response_active = True
+                            # Reset output guardrail state for the new response
+                            _agent_buffer = ""
+                            _agent_blocked = False
+                            _agent_passed_emitted = False
                         elif event_type in ("response.done", "response.cancelled"):
                             _response_active = False
 
                         # ── Standard event forwarding ──
                         if event_type == "response.audio.delta":
-                            await safe_send({
-                                "type": "audio_delta",
-                                "delta": event.get("delta", ""),
-                            })
+                            # Suppress audio after output guardrail has blocked
+                            if not _agent_blocked:
+                                await safe_send({
+                                    "type": "audio_delta",
+                                    "delta": event.get("delta", ""),
+                                })
                         elif event_type in ("response.output_text.delta", "response.text.delta", "response.audio_transcript.delta"):
+                            delta = event.get("delta", "")
+                            # ── Streaming output guardrail ──
+                            if guardrail_on and not _agent_blocked:
+                                _agent_buffer += delta
+                                passed, reason = check_text_local(_agent_buffer)
+                                if not passed:
+                                    _agent_blocked = True
+                                    # Stop the AI mid-stream and silence playback
+                                    if _response_active:
+                                        await ws_send(openai_ws, {"type": "response.cancel"}, logger)
+                                    await safe_send({"type": "playback_stop"})
+                                    await safe_send({"type": "agent_done"})
+                                    snippet = _agent_buffer[:80] + ("…" if len(_agent_buffer) > 80 else "")
+                                    await safe_send({
+                                        "type": "guardrail_chat",
+                                        "passed": False,
+                                        "side": "output",
+                                        "snippet": snippet,
+                                        "reason": reason,
+                                    })
+                                    continue  # don't forward this delta
+                            if _agent_blocked:
+                                continue
                             await safe_send(
-                                {"type": "agent_delta", "content": event.get("delta", "")}
+                                {"type": "agent_delta", "content": delta}
                             )
                         elif event_type in ("response.output_text.done", "response.done"):
                             await safe_send({"type": "agent_done"})
+                            # Emit success chip once per response if output passed
+                            if (
+                                guardrail_on
+                                and not _agent_blocked
+                                and not _agent_passed_emitted
+                                and _agent_buffer.strip()
+                            ):
+                                _agent_passed_emitted = True
+                                await safe_send({
+                                    "type": "guardrail_chat",
+                                    "passed": True,
+                                    "side": "output",
+                                })
                             if event_type == "response.done":
                                 # Accumulate real usage from OpenAI
                                 r = event.get("response", {})
@@ -822,7 +832,7 @@ async def realtime_proxy(client_ws: WebSocket):
                             )
                             await forward_debug_event(event, safe_send)
 
-                            # ── Keyword guardrail check ──
+                            # ── Keyword guardrail check (input) ──
                             blocked = False
                             if guardrail_on and is_valid:
                                 passed, reason = check_text_local(transcript)
@@ -830,19 +840,17 @@ async def realtime_proxy(client_ws: WebSocket):
                                     await safe_send({
                                         "type": "guardrail_chat",
                                         "passed": True,
-                                        "message": "✓ [使用者輸入] 安全檢查通過（關鍵字）",
+                                        "side": "input",
                                     })
                                 else:
                                     blocked = True
-                                    snippet = transcript[:50] + ("…" if len(transcript) > 50 else "")
+                                    snippet = transcript[:80] + ("…" if len(transcript) > 80 else "")
                                     await safe_send({
                                         "type": "guardrail_chat",
                                         "passed": False,
-                                        "message": (
-                                            f"✗ [使用者輸入] 已攔截（關鍵字）\n"
-                                            f"　內容：「{snippet}」\n"
-                                            f"　原因：{reason}"
-                                        ),
+                                        "side": "input",
+                                        "snippet": snippet,
+                                        "reason": reason,
                                     })
 
                             if not blocked and guardrail_on:
@@ -898,20 +906,32 @@ async def realtime_proxy(client_ws: WebSocket):
                                     }
                                 )
 
-                                # Fill the real browser form via Playwright CDP
-                                result = await connect_and_fill(form_payload)
-                                if result == "ok":
-                                    await safe_send({"type": "browser_fill_done"})
-                                    tool_output = {
-                                        "status": "success",
-                                        "message": "已自動填入瀏覽器表單，請使用者確認後提交。",
-                                    }
+                                # Merge profile defaults as a backstop (AI values win)
+                                form_payload = skill.merge_profile_defaults(form_payload, profile)
+                                # Validate payload and fill via the active skill
+                                try:
+                                    parsed = skill.parse_payload(form_payload)
+                                except Exception as ve:
+                                    err_msg = f"欄位驗證失敗：{ve}"
+                                    await safe_send({"type": "browser_fill_error", "message": err_msg})
+                                    tool_output = {"status": "error", "message": err_msg}
                                 else:
-                                    await safe_send({"type": "browser_fill_error", "message": result})
-                                    tool_output = {
-                                        "status": "error",
-                                        "message": f"自動填表失敗：{result}",
-                                    }
+                                    page, err = await open_form_page(skill.url, skill.ready_selector)
+                                    if err:
+                                        await safe_send({"type": "browser_fill_error", "message": err})
+                                        tool_output = {"status": "error", "message": f"自動填表失敗：{err}"}
+                                    else:
+                                        try:
+                                            await skill.fill(page, parsed)
+                                            await safe_send({"type": "browser_fill_done"})
+                                            tool_output = {
+                                                "status": "success",
+                                                "message": "已自動填入瀏覽器表單，請使用者確認後提交。",
+                                            }
+                                        except Exception as fe:
+                                            err_msg = f"填寫發生錯誤：{fe}"
+                                            await safe_send({"type": "browser_fill_error", "message": err_msg})
+                                            tool_output = {"status": "error", "message": err_msg}
 
                                 await ws_send(
                                     openai_ws,

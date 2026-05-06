@@ -48,6 +48,44 @@ const modelSelect = document.getElementById("model-select");
   }
 })();
 
+// Form selector
+const formSelect = document.getElementById("form-select");
+const formLink = document.getElementById("form-link");
+const updateFormLink = () => {
+  const opt = formSelect.selectedOptions[0];
+  if (opt && opt.dataset.url) {
+    formLink.href = opt.dataset.url;
+    formLink.style.display = "";
+  } else {
+    formLink.style.display = "none";
+  }
+};
+(async () => {
+  try {
+    const resp = await fetch("/api/forms");
+    const forms = await resp.json();
+    if (!Array.isArray(forms) || forms.length === 0) {
+      throw new Error("no forms");
+    }
+    forms.forEach((f) => {
+      const opt = document.createElement("option");
+      opt.value = f.id;
+      opt.textContent = f.label;
+      opt.title = f.description || "";
+      opt.dataset.url = f.url || "";
+      formSelect.appendChild(opt);
+    });
+    updateFormLink();
+  } catch (e) {
+    const opt = document.createElement("option");
+    opt.value = "taxi";
+    opt.textContent = "計程車費請領單";
+    formSelect.appendChild(opt);
+    updateFormLink();
+  }
+})();
+formSelect.addEventListener("change", updateFormLink);
+
 // Guardrail state
 const guardrailEnabled = document.getElementById("guardrail-enabled");
 const guardrailWarningEl = document.getElementById("guardrail-warning");
@@ -230,6 +268,9 @@ const startConversationRealtime = async () => {
   const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
   const params = new URLSearchParams();
   params.set("model", modelSelect.value);
+  if (formSelect.value) {
+    params.set("form", formSelect.value);
+  }
   if (guardrailEnabled.checked) {
     params.set("guardrail", "keyword");
   }
@@ -296,8 +337,14 @@ const startConversationRealtime = async () => {
     } else if (data.type === "audio_delta") {
       playAudioDelta(data.delta);
     } else if (data.type === "guardrail_chat") {
-      const cssRole = data.passed ? "guardrail-pass" : "guardrail";
-      conversationMessages.push({ role: cssRole, content: data.message });
+      conversationMessages.push({
+        role: "guardrail-chip",
+        passed: !!data.passed,
+        side: data.side || "input",
+        snippet: data.snippet || "",
+        reason: data.reason || "",
+        legacy: data.message || "",
+      });
       renderChat();
     } else if (data.type === "session_event") {
       appendSessionEvent(data);
@@ -344,6 +391,37 @@ const stopConversationRealtime = () => {
 
 // ── Render ──
 
+const escapeHtml = (s) => String(s)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+const ICON_CHECK = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+const ICON_BLOCK = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+
+const SIDE_LABELS = { input: "使用者輸入", output: "模型輸出" };
+
+const renderGuardrailChip = (m) => {
+  const status = m.passed ? "通過" : "已攔截";
+  const sideLabel = SIDE_LABELS[m.side] || m.side;
+  const icon = m.passed ? ICON_CHECK : ICON_BLOCK;
+  const headerHtml = `
+    <div class="ck-gr-header">
+      <span class="ck-gr-icon">${icon}</span>
+      <span class="ck-gr-meta">Guardrail · 關鍵字</span>
+      <span class="ck-gr-side">${escapeHtml(sideLabel)}</span>
+      <span class="ck-gr-status">${escapeHtml(status)}</span>
+    </div>`;
+  let bodyHtml = "";
+  if (!m.passed && (m.snippet || m.reason)) {
+    bodyHtml = `
+      <div class="ck-gr-body">
+        ${m.snippet ? `<div class="ck-gr-snippet">「${escapeHtml(m.snippet)}」</div>` : ""}
+        ${m.reason ? `<div class="ck-gr-reason">${escapeHtml(m.reason)}</div>` : ""}
+      </div>`;
+  }
+  return headerHtml + bodyHtml;
+};
+
 const renderChat = () => {
   for (let i = 0; i < conversationMessages.length; i += 1) {
     const message = conversationMessages[i];
@@ -352,6 +430,16 @@ const renderChat = () => {
       bubble = document.createElement("div");
       conversationMessageElements[i] = bubble;
       chat.appendChild(bubble);
+    }
+    if (message.role === "guardrail-chip") {
+      const desiredClass = `ck-gr-chip ${message.passed ? "ck-gr-pass" : "ck-gr-block"}`;
+      if (bubble.className !== desiredClass) bubble.className = desiredClass;
+      const html = renderGuardrailChip(message);
+      if (bubble._lastHtml !== html) {
+        bubble.innerHTML = html;
+        bubble._lastHtml = html;
+      }
+      continue;
     }
     const desiredClass = `chat-message ${message.role}`;
     if (bubble.className !== desiredClass) bubble.className = desiredClass;

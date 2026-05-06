@@ -3,57 +3,60 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Session Logs</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <title>Session Logs · 語音填表</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260506a" />
   </head>
-  <body>
-    <header>
-      <div class="container hero">
-        <h1>Session Logs</h1>
-        <p>每次 WebSocket 連線的完整事件時序與表單提交記錄。</p>
-        <div class="tabs">
-          <a class="tab-button" href="/">返回填單</a>
-        </div>
+  <body class="ck-body ck-body-logs">
+    <header class="ck-app-header">
+      <div class="ck-app-header-inner">
+        <span class="ck-app-title">Session Logs</span>
+        <a class="ck-link-quiet" href="/">← 回填單</a>
       </div>
     </header>
 
-    <main class="container">
-      <section class="card">
-        <div class="section-title"><span>📋</span>Session Logs</div>
-        <div class="log-summary" id="log-summary">
-          <div class="summary-card">
-            <div class="summary-label">總筆數</div>
-            <div class="summary-value" id="summary-count">0</div>
-          </div>
-          <div class="summary-card cost">
-            <div class="summary-label">總成本</div>
-            <div class="summary-value" id="summary-cost">$0.000</div>
-          </div>
-          <div class="summary-card latest">
-            <div class="summary-label">平均填表時間</div>
-            <div class="summary-value" id="summary-avg-time">--</div>
-          </div>
+    <main class="ck-main ck-main-wide">
+      <div class="ck-page-header">
+        <h1 class="ck-page-h1">Session Logs</h1>
+        <p class="ck-page-sub">每次 WebSocket 連線的完整事件時序與表單提交記錄</p>
+      </div>
+
+      <!-- Summary stats -->
+      <div class="ck-stats">
+        <div class="ck-stat">
+          <span class="ck-stat-label">總筆數</span>
+          <span class="ck-stat-value" id="summary-count">0</span>
         </div>
-        <div class="log-toolbar">
-          <input id="log-search" class="log-search" placeholder="搜尋 Session ID / 內容關鍵字" />
-          <select id="log-mode" class="log-select">
-            <option value="all">所有模式</option>
-            <option value="stt">STT</option>
-            <option value="conversation">Conversation</option>
-          </select>
-          <select id="log-guardrail" class="log-select">
-            <option value="all">所有 Guardrail</option>
-            <option value="keyword">關鍵字</option>
-            <option value="off">Guardrail OFF</option>
-          </select>
-          <button class="button secondary" id="log-refresh">重新整理</button>
-          <button class="log-delete-all-btn" id="log-delete-all">全部清除</button>
+        <div class="ck-stat">
+          <span class="ck-stat-label">總成本</span>
+          <span class="ck-stat-value" id="summary-cost">$0.000</span>
         </div>
-        <div id="logs" class="log-list"></div>
-        <div id="logs-empty" class="empty-state" style="display: none;">尚無紀錄</div>
-      </section>
+        <div class="ck-stat">
+          <span class="ck-stat-label">平均填表時間</span>
+          <span class="ck-stat-value" id="summary-avg-time">--</span>
+        </div>
+      </div>
+
+      <!-- Toolbar -->
+      <div class="ck-toolbar">
+        <input id="log-search" class="ck-input" placeholder="搜尋 Session ID / 內容關鍵字" />
+        <select id="log-mode" class="ck-pill-select">
+          <option value="all">所有模式</option>
+          <option value="stt">STT</option>
+          <option value="conversation">Conversation</option>
+        </select>
+        <select id="log-guardrail" class="ck-pill-select">
+          <option value="all">所有 Guardrail</option>
+          <option value="keyword">關鍵字</option>
+          <option value="off">Guardrail OFF</option>
+        </select>
+        <button class="ck-btn-ghost" id="log-refresh">重新整理</button>
+        <button class="ck-btn-danger-ghost" id="log-delete-all">全部清除</button>
+      </div>
+
+      <div id="logs" class="log-list ck-log-list"></div>
+      <div id="logs-empty" class="ck-empty" style="display: none;">尚無紀錄</div>
     </main>
 
-    <script src="/static/logs.js?v=20260330a"></script>
+    <script src="/static/logs.js?v=20260506a"></script>
   </body>
 </html>
