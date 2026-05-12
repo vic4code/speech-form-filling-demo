@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>語音填表</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260506b" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260512d" />
   </head>
   <body class="ck-body">
     <header class="ck-app-header">
@@ -23,7 +23,13 @@
           <a id="form-link" target="_blank" rel="noopener" class="ck-link-quiet">原始表單 ↗</a>
         </div>
         <div class="ck-settings-secondary">
-          <select id="model-select" class="ck-pill-select" title="選擇模型"></select>
+          <select id="mode-select" class="ck-pill-select" title="選擇語音模式">
+            <option value="realtime">即時對話</option>
+            <option value="batch">錄音整理</option>
+          </select>
+          <select id="model-select" class="ck-pill-select" title="選擇 Realtime 模型"></select>
+          <select id="transcribe-model-select" class="ck-pill-select" title="轉譯模型" style="display:none"></select>
+          <select id="structure-model-select" class="ck-pill-select" title="整理模型" style="display:none"></select>
           <label class="ck-toggle-pill">
             <input type="checkbox" id="guardrail-enabled" />
             <span>Guardrail</span>
@@ -77,6 +83,6 @@
       </div>
     </footer>
 
-    <script src="/static/app.js?v=20260506b"></script>
+    <script src="/static/app.js?v=20260512h"></script>
   </body>
 </html>

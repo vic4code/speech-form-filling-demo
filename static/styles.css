@@ -1378,6 +1378,90 @@ textarea {
   color: #0d0d0d;
 }
 
+.ck-body .ck-batch-review {
+  width: min(720px, 100%);
+  display: grid;
+  gap: 12px;
+}
+
+.ck-batch-review-head {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1f2937;
+}
+
+.ck-batch-review-body {
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #263238;
+  background: #f7f8fa;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.ck-batch-errors {
+  display: grid;
+  gap: 6px;
+  color: #991b1b;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ck-batch-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ck-batch-confirm {
+  border: 1px solid #202124;
+  background: #202124;
+  color: #fff;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.ck-batch-confirm:hover {
+  background: #3c4043;
+  border-color: #3c4043;
+}
+
+.ck-batch-patch {
+  border: 1px solid #d1d5db;
+  background: #fff;
+  color: #374151;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ck-batch-patch::before {
+  content: "🎙";
+  font-size: 14px;
+}
+
+.ck-batch-patch:hover {
+  background: #f3f4f6;
+  border-color: #9ca3af;
+}
+
 .ck-body .chat-message.typing {
   font-style: italic;
   color: #8a8a8a;
@@ -1936,5 +2020,3 @@ textarea {
   .ck-toolbar { flex-direction: column; align-items: stretch; }
   .ck-toolbar > * { width: 100%; }
 }
-
-
