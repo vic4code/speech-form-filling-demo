@@ -412,6 +412,7 @@ const submitBatchPatch = async (blob, correctionText) => {
       guardrailMode: guardrailEnabled.checked ? "keyword" : null,
       transcribeModel: transcribeModelSelect.value || undefined,
       structureModel: structureModelSelect.value || undefined,
+      previousErrors: batchPending.errors && batchPending.errors.length ? batchPending.errors : undefined,
     };
     if (blob) {
       body.audioBase64 = await blobToDataUrl(blob);

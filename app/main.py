@@ -200,6 +200,7 @@ class BatchFormPatchPayload(BaseModel):
     guardrailMode: str | None = None
     transcribeModel: str | None = None
     structureModel: str | None = None
+    previousErrors: list[str] = Field(default_factory=list)
 
 
 class BatchFormPrepareResponse(BaseModel):
@@ -833,15 +834,21 @@ async def patch_form_with_correction(
     current_payload: dict[str, Any],
     correction: str,
     model: str | None = None,
+    previous_errors: list[str] | None = None,
 ) -> tuple[dict[str, Any], RequestMeta]:
     skill = get_skill(form_id)
     client = AsyncOpenAI()
     schema = _json_schema_for_batch(skill)
     today = datetime.now().date().isoformat()
+    error_block = ""
+    if previous_errors:
+        joined = "、".join(previous_errors)
+        error_block = f"上次驗證失敗的欄位錯誤（請根據使用者的修改指示修正這些欄位）：{joined}\n\n"
     prompt = (
         "你是企業內部表單資料整理器。使用者已填寫了表單草稿，現在提供了修改指示。\n"
         "請根據修改指示調整表單資料，其餘欄位保持不變。只輸出符合 JSON schema 的完整資料，不要輸出 markdown。\n\n"
         f"現有表單資料（JSON）：\n{json.dumps(current_payload, ensure_ascii=False, indent=2)}\n\n"
+        f"{error_block}"
         f"使用者修改指示：\n{correction}\n\n"
         f"今天日期：{today}（Asia/Taipei）"
     )
@@ -987,6 +994,7 @@ async def patch_batch_form(payload: BatchFormPatchPayload) -> BatchFormPrepareRe
             payload.currentPayload,
             correction_text,
             model=payload.structureModel,
+            previous_errors=payload.previousErrors or None,
         )
     except APIError as exc:
         raise HTTPException(status_code=400, detail=f"表單修改失敗：{exc.message}") from exc
