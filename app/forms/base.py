@@ -14,6 +14,7 @@ only requires reimplementing fill().
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Type
 
@@ -78,6 +79,18 @@ class FormSkill:
             ),
             "parameters": params,
         }
+
+    def field_labels(self) -> dict[str, str]:
+        """Return {field_key: short_chinese_label} extracted from field descriptions."""
+        labels: dict[str, str] = {}
+        for name, info in self.payload_model.model_fields.items():
+            desc = info.description or ""
+            alias = str(info.alias) if info.alias else name
+            short = re.split(r"[（。，：\(\n]", desc, maxsplit=1)[0].strip()
+            label = short or name
+            labels[name] = label
+            labels[alias] = label
+        return labels
 
     def parse_payload(self, raw: dict[str, Any]) -> BaseModel:
         return self.payload_model.model_validate(raw)

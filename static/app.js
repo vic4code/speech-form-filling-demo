@@ -7,6 +7,9 @@ const conversationStart = document.getElementById("conversation-start");
 const conversationStop = document.getElementById("conversation-stop");
 const browserStatusEl = document.getElementById("browser-status");
 const browserStatusText = document.getElementById("browser-status-text");
+const modeSelect = document.getElementById("mode-select");
+const apiBase = window.location.protocol === "file:" ? "http://127.0.0.1:8000" : "";
+const wsHost = window.location.protocol === "file:" ? "127.0.0.1:8000" : window.location.host;
 
 let conversationListening = false;
 let conversationMessages = [];
@@ -26,12 +29,19 @@ let sessionDebugLog = [];
 let _wsConnId = null;
 let conversationAudioPlayCtx = null;
 let conversationNextPlayTime = 0;
+let batchRecorder = null;
+let batchStream = null;
+let batchChunks = [];
+let batchPending = null;
 
-// Model selector
+// Model selectors
 const modelSelect = document.getElementById("model-select");
+const transcribeModelSelect = document.getElementById("transcribe-model-select");
+const structureModelSelect = document.getElementById("structure-model-select");
+
 (async () => {
   try {
-    const resp = await fetch("/api/models");
+    const resp = await fetch(`${apiBase}/api/models`);
     const data = await resp.json();
     data.models.forEach((m) => {
       const opt = document.createElement("option");
@@ -40,13 +50,48 @@ const modelSelect = document.getElementById("model-select");
       if (m.id === data.default) opt.selected = true;
       modelSelect.appendChild(opt);
     });
+    const batchInfo = data.batch || {};
+    const transcriptionModels = batchInfo.transcription || [
+      { id: "whisper-1", label: "Whisper 1" },
+      { id: "gpt-4o-mini-transcribe", label: "GPT-4o Mini Transcribe" },
+      { id: "gpt-4o-transcribe", label: "GPT-4o Transcribe" },
+    ];
+    const structuringModels = batchInfo.structuring || [
+      { id: "gpt-4o-mini", label: "GPT-4o Mini" },
+      { id: "gpt-4o", label: "GPT-4o" },
+      { id: "gpt-4.1-mini", label: "GPT-4.1 Mini" },
+      { id: "gpt-4.1", label: "GPT-4.1" },
+    ];
+    const defaultTranscription = batchInfo.default_transcription || "gpt-4o-transcribe";
+    const defaultStructuring = batchInfo.default_structuring || "gpt-4.1";
+    transcriptionModels.forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = m.label;
+      if (m.id === defaultTranscription) opt.selected = true;
+      transcribeModelSelect.appendChild(opt);
+    });
+    structuringModels.forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = m.label;
+      if (m.id === defaultStructuring) opt.selected = true;
+      structureModelSelect.appendChild(opt);
+    });
   } catch (e) {
     const opt = document.createElement("option");
-    opt.value = "gpt-4o-realtime-preview-2024-12-17";
-    opt.textContent = "GPT-4o Realtime (default)";
+    opt.value = "gpt-realtime-2";
+    opt.textContent = "GPT Realtime 2 (default)";
     modelSelect.appendChild(opt);
   }
 })();
+
+const updateModelSelectVisibility = () => {
+  const isBatch = modeSelect.value === "batch";
+  modelSelect.style.display = isBatch ? "none" : "";
+  transcribeModelSelect.style.display = isBatch ? "" : "none";
+  structureModelSelect.style.display = isBatch ? "" : "none";
+};
 
 // Form selector
 const formSelect = document.getElementById("form-select");
@@ -62,7 +107,7 @@ const updateFormLink = () => {
 };
 (async () => {
   try {
-    const resp = await fetch("/api/forms");
+    const resp = await fetch(`${apiBase}/api/forms`);
     const forms = await resp.json();
     if (!Array.isArray(forms) || forms.length === 0) {
       throw new Error("no forms");
@@ -97,7 +142,7 @@ const updateGuardrailInfo = () => {
     guardrailInfoEl.style.display = "none";
     return;
   }
-  fetch("/api/guardrail-info").then(r => r.json()).then(info => {
+  fetch(`${apiBase}/api/guardrail-info`).then(r => r.json()).then(info => {
     guardrailInfoEl.innerHTML = `<b>Guardrail:</b> ${info.description}`;
     guardrailInfoEl.style.display = "block";
   }).catch(() => { guardrailInfoEl.style.display = "none"; });
@@ -181,6 +226,247 @@ const stopConversationAudio = () => {
 const sendConversationText = (text) => {
   if (!conversationSocket || conversationSocket.readyState !== WebSocket.OPEN) return;
   conversationSocket.send(JSON.stringify({ text }));
+};
+
+// ── Batch recording ──
+
+const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(reader.result);
+  reader.onerror = () => reject(reader.error || new Error("讀取錄音失敗"));
+  reader.readAsDataURL(blob);
+});
+
+const parseJsonOrTextError = async (resp) => {
+  const contentType = resp.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const data = await resp.json();
+    return data.detail || data.message || JSON.stringify(data);
+  }
+  const text = await resp.text();
+  return text || `HTTP ${resp.status}`;
+};
+
+const stopBatchStream = () => {
+  if (batchStream) {
+    batchStream.getTracks().forEach((track) => track.stop());
+    batchStream = null;
+  }
+};
+
+const startBatchRecording = async () => {
+  if (batchRecorder && batchRecorder.state === "recording") return;
+  batchChunks = [];
+  batchPending = null;
+  batchStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+    },
+  });
+  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : "audio/webm";
+  batchRecorder = new MediaRecorder(batchStream, { mimeType });
+  batchRecorder.ondataavailable = (event) => {
+    if (event.data && event.data.size) batchChunks.push(event.data);
+  };
+  batchRecorder.onstop = async () => {
+    stopBatchStream();
+    const blob = new Blob(batchChunks, { type: batchRecorder.mimeType || "audio/webm" });
+    batchRecorder = null;
+    if (!blob.size) {
+      setConversationListeningState(false, "沒有錄到聲音");
+      return;
+    }
+    await submitBatchRecording(blob);
+  };
+  conversationMessages.push({ role: "agent", content: "正在錄音，講完後按停止，我會整理成表單讓你確認。" });
+  renderChat();
+  batchRecorder.start();
+  setConversationListeningState(true, "錄音中");
+  markConversationFormStart();
+};
+
+const stopBatchRecording = () => {
+  if (batchRecorder && batchRecorder.state === "recording") {
+    setConversationListeningState(false, "正在整理錄音…");
+    batchRecorder.stop();
+  }
+};
+
+const submitBatchRecording = async (blob) => {
+  try {
+    setConversationListeningState(false, "正在轉譯並整理表單…");
+    const audioBase64 = await blobToDataUrl(blob);
+    const resp = await fetch(`${apiBase}/api/batch-form/prepare`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        form: formSelect.value,
+        audioBase64,
+        mimeType: blob.type || "audio/webm",
+        guardrailMode: guardrailEnabled.checked ? "keyword" : null,
+        transcribeModel: transcribeModelSelect.value || undefined,
+        structureModel: structureModelSelect.value || undefined,
+      }),
+    });
+    if (!resp.ok) {
+      throw new Error(await parseJsonOrTextError(resp));
+    }
+    const data = await resp.json();
+    if (data.transcript) {
+      conversationMessages.push({ role: "user", content: data.transcript });
+    }
+    if (data.reviewText || data.payload) {
+      conversationMessages.push({
+        role: "batch-review",
+        content: data.reviewText || JSON.stringify(data.payload, null, 2),
+        payload: data.payload,
+        meta: data.meta || null,
+        ready: !!data.ready,
+        errors: data.errors || [],
+      });
+    }
+    if (!data.ready) {
+      conversationMessages.push({
+        role: "agent",
+        content: `已整理成草稿，但以下資訊還不夠，請再說一遍：${(data.errors || []).join("、") || "部分必填欄位"}`,
+      });
+    } else {
+      batchPending = data;
+    }
+    renderChat();
+    setConversationListeningState(false, data.ready ? "請確認整理後的表單" : "需要補充資訊");
+  } catch (error) {
+    conversationMessages.push({ role: "agent", content: `錄音整理失敗：${error.message}` });
+    renderChat();
+    setConversationListeningState(false, "錄音整理失敗");
+  }
+};
+
+const confirmBatchFill = async () => {
+  if (!batchPending || !batchPending.payload) return;
+  showBrowserStatus("已確認，正在自動填寫瀏覽器表單…", "info");
+  try {
+    const resp = await fetch(`${apiBase}/api/batch-form/fill`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        form: formSelect.value,
+        payload: batchPending.payload,
+        meta: batchPending.meta || null,
+        guardrailMode: guardrailEnabled.checked ? "keyword" : null,
+      }),
+    });
+    if (!resp.ok) {
+      throw new Error(await parseJsonOrTextError(resp));
+    }
+    const data = await resp.json();
+    showBrowserStatus("瀏覽器表單已自動填寫完成！", "success");
+    conversationMessages.push({ role: "agent", content: "已填入瀏覽器表單，請在送出前再次確認。" });
+    batchPending = null;
+  } catch (error) {
+    showBrowserStatus(`填寫失敗：${error.message}`, "error");
+    conversationMessages.push({ role: "agent", content: `填寫失敗：${error.message}` });
+  }
+  renderChat();
+};
+
+const startBatchPatch = async () => {
+  if (!batchPending) return;
+  if (batchRecorder && batchRecorder.state === "recording") return;
+  batchChunks = [];
+  batchStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+  });
+  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : "audio/webm";
+  batchRecorder = new MediaRecorder(batchStream, { mimeType });
+  batchRecorder.ondataavailable = (event) => {
+    if (event.data && event.data.size) batchChunks.push(event.data);
+  };
+  batchRecorder.onstop = async () => {
+    stopBatchStream();
+    const blob = new Blob(batchChunks, { type: batchRecorder.mimeType || "audio/webm" });
+    batchRecorder = null;
+    if (!blob.size) {
+      setConversationListeningState(false, "沒有錄到聲音");
+      return;
+    }
+    await submitBatchPatch(blob, null);
+  };
+  batchRecorder.start();
+  setConversationListeningState(true, "語音修改錄音中，講完後按停止");
+};
+
+const submitBatchPatch = async (blob, correctionText) => {
+  if (!batchPending) return;
+  try {
+    setConversationListeningState(false, "正在修改表單…");
+    const body = {
+      form: formSelect.value,
+      currentPayload: batchPending.payload,
+      guardrailMode: guardrailEnabled.checked ? "keyword" : null,
+      transcribeModel: transcribeModelSelect.value || undefined,
+      structureModel: structureModelSelect.value || undefined,
+      previousErrors: batchPending.errors && batchPending.errors.length ? batchPending.errors : undefined,
+    };
+    if (blob) {
+      body.audioBase64 = await blobToDataUrl(blob);
+      body.mimeType = blob.type || "audio/webm";
+    }
+    if (correctionText) {
+      body.correctionText = correctionText;
+    }
+    const resp = await fetch(`${apiBase}/api/batch-form/patch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      throw new Error(await parseJsonOrTextError(resp));
+    }
+    const data = await resp.json();
+    if (data.transcript) {
+      conversationMessages.push({ role: "user", content: data.transcript });
+    }
+    // Replace last batch-review in place
+    const reviewIdx = conversationMessages.reduce((last, m, i) => m.role === "batch-review" ? i : last, -1);
+    const reviewMsg = {
+      role: "batch-review",
+      content: data.reviewText || JSON.stringify(data.payload, null, 2),
+      payload: data.payload,
+      meta: data.meta || null,
+      ready: !!data.ready,
+      errors: data.errors || [],
+    };
+    if (reviewIdx >= 0) {
+      conversationMessages[reviewIdx] = reviewMsg;
+      if (conversationMessageElements[reviewIdx]) {
+        conversationMessageElements[reviewIdx]._lastHtml = null;
+      }
+    } else {
+      conversationMessages.push(reviewMsg);
+    }
+    if (data.payload) {
+      batchPending = data;
+    }
+    if (!data.ready && data.errors && data.errors.length) {
+      conversationMessages.push({
+        role: "agent",
+        content: `修改後仍有缺漏，請補充：${data.errors.join("、")}`,
+      });
+    }
+    renderChat();
+    setConversationListeningState(false, data.ready ? "請確認修改後的表單" : "需要補充資訊");
+  } catch (error) {
+    conversationMessages.push({ role: "agent", content: `修改失敗：${error.message}` });
+    renderChat();
+    setConversationListeningState(false, "修改失敗");
+  }
 };
 
 // ── Audio playback ──
@@ -274,7 +560,7 @@ const startConversationRealtime = async () => {
   if (guardrailEnabled.checked) {
     params.set("guardrail", "keyword");
   }
-  conversationSocket = new WebSocket(`${wsProtocol}://${window.location.host}/ws/realtime?${params.toString()}`);
+  conversationSocket = new WebSocket(`${wsProtocol}://${wsHost}/ws/realtime?${params.toString()}`);
   conversationSocket.onopen = async () => {
     setConversationListeningState(true, "已連線，語音辨識進行中");
     markConversationFormStart();
@@ -422,6 +708,23 @@ const renderGuardrailChip = (m) => {
   return headerHtml + bodyHtml;
 };
 
+const renderBatchReview = (m) => {
+  const content = escapeHtml(m.content || "");
+  const title = m.ready ? "模型整理後的表單" : "模型整理的表單草稿";
+  const errors = Array.isArray(m.errors) && m.errors.length
+    ? `<div class="ck-batch-errors">${m.errors.map((e) => `<div>${escapeHtml(e)}</div>`).join("")}</div>`
+    : "";
+  const confirmBtn = m.ready
+    ? '<button type="button" class="ck-batch-confirm" data-action="batch-confirm">確認填入瀏覽器表單</button>'
+    : "";
+  return `
+    <div class="ck-batch-review-head">${title}</div>
+    <pre class="ck-batch-review-body">${content}</pre>
+    ${errors}
+    ${confirmBtn ? `<div class="ck-batch-actions">${confirmBtn}</div>` : ""}
+  `;
+};
+
 const renderChat = () => {
   for (let i = 0; i < conversationMessages.length; i += 1) {
     const message = conversationMessages[i];
@@ -441,6 +744,16 @@ const renderChat = () => {
       }
       continue;
     }
+    if (message.role === "batch-review") {
+      const desiredClass = "chat-message agent ck-batch-review";
+      if (bubble.className !== desiredClass) bubble.className = desiredClass;
+      const html = renderBatchReview(message);
+      if (bubble._lastHtml !== html) {
+        bubble.innerHTML = html;
+        bubble._lastHtml = html;
+      }
+      continue;
+    }
     const desiredClass = `chat-message ${message.role}`;
     if (bubble.className !== desiredClass) bubble.className = desiredClass;
     if (bubble.textContent !== message.content) bubble.textContent = message.content;
@@ -452,13 +765,28 @@ const renderChat = () => {
     }
     conversationMessageElements = conversationMessageElements.slice(0, conversationMessages.length);
   }
-  chat.scrollTop = chat.scrollHeight;
+  // ChatKit layout: the page is the scroll container, not .chat.
+  // Stick to bottom only when the user is already near it, so scrolling up
+  // to re-read history isn't yanked back down.
+  const scroller = document.scrollingElement || document.documentElement;
+  const distFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+  if (distFromBottom < 240) {
+    scroller.scrollTop = scroller.scrollHeight;
+  }
 };
 
 // ── Event listeners ──
 
 conversationStart.addEventListener("click", () => {
   if (conversationListening) return;
+  if (modeSelect.value === "batch") {
+    if (batchPending) {
+      startBatchPatch();
+    } else {
+      startBatchRecording();
+    }
+    return;
+  }
   if (!conversationAudioPlayCtx) {
     conversationAudioPlayCtx = new AudioContext({ sampleRate: 24000 });
     conversationNextPlayTime = conversationAudioPlayCtx.currentTime;
@@ -469,15 +797,45 @@ conversationStart.addEventListener("click", () => {
 });
 
 conversationStop.addEventListener("click", () => {
-  stopConversationRealtime();
+  if (modeSelect.value === "batch") {
+    stopBatchRecording();
+  } else {
+    stopConversationRealtime();
+  }
+});
+
+chat.addEventListener("click", (event) => {
+  const target = event.target.closest("[data-action]");
+  if (!target) return;
+  if (target.dataset.action === "batch-confirm") {
+    confirmBatchFill();
+  }
+});
+
+modeSelect.addEventListener("change", () => {
+  if (conversationListening) {
+    if (modeSelect.value === "batch") {
+      stopConversationRealtime();
+    } else {
+      stopBatchRecording();
+    }
+  }
+  updateModelSelectVisibility();
+  setConversationListeningState(false, modeSelect.value === "batch" ? "錄音整理模式" : "尚未連線");
 });
 
 const handleUserMessage = (text) => {
   const trimmed = text.trim();
   if (!trimmed) return;
   markConversationFormStart();
-  conversationMessages.push({ role: "user", content: trimmed });
   chatInput.value = "";
+  if (modeSelect.value === "batch" && batchPending) {
+    conversationMessages.push({ role: "user", content: trimmed });
+    renderChat();
+    submitBatchPatch(null, trimmed);
+    return;
+  }
+  conversationMessages.push({ role: "user", content: trimmed });
   renderChat();
   sendConversationText(trimmed);
 };

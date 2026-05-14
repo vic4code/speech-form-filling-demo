@@ -7,7 +7,9 @@ import asyncio
 import base64
 import time
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -19,6 +21,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 from dotenv import load_dotenv
+from openai import APIError, AsyncOpenAI
 import websockets
 
 from app.guardrails import check_text_local
@@ -32,6 +35,13 @@ load_dotenv()
 # ── Realtime model definitions with official pricing (per 1K tokens) ──
 # Source: https://platform.openai.com/docs/pricing (March 2025)
 REALTIME_MODELS: dict[str, dict] = {
+    "gpt-realtime-2": {
+        "label": "GPT Realtime 2",
+        "text_input_per_1k": 0.004,       # $4.00 / 1M
+        "text_output_per_1k": 0.024,      # $24.00 / 1M
+        "audio_input_per_1k": 0.032,      # $32.00 / 1M
+        "audio_output_per_1k": 0.064,     # $64.00 / 1M
+    },
     "gpt-4o-realtime-preview-2024-12-17": {
         "label": "GPT-4o Realtime (2024-12-17)",
         "text_input_per_1k": 0.0055,      # $5.50 / 1M
@@ -56,7 +66,7 @@ REALTIME_MODELS: dict[str, dict] = {
 }
 
 DEFAULT_REALTIME_MODEL = os.getenv(
-    "OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17"
+    "OPENAI_REALTIME_MODEL", "gpt-realtime-2"
 )
 
 
@@ -82,7 +92,20 @@ AUDIO_COST_PER_1K_OUTPUT = _default_pricing["audio_output_per_1k"]
 
 
 # OpenAI API key is now managed by LiteLLM proxy (config.yaml)
-OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+OPENAI_BATCH_STRUCTURING_MODEL = os.getenv("OPENAI_BATCH_STRUCTURING_MODEL", "gpt-4.1")
+
+BATCH_TRANSCRIPTION_MODELS = [
+    {"id": "whisper-1", "label": "Whisper 1"},
+    {"id": "gpt-4o-mini-transcribe", "label": "GPT-4o Mini Transcribe"},
+    {"id": "gpt-4o-transcribe", "label": "GPT-4o Transcribe"},
+]
+BATCH_STRUCTURING_MODELS = [
+    {"id": "gpt-4o-mini", "label": "GPT-4o Mini"},
+    {"id": "gpt-4o", "label": "GPT-4o"},
+    {"id": "gpt-4.1-mini", "label": "GPT-4.1 Mini"},
+    {"id": "gpt-4.1", "label": "GPT-4.1"},
+]
 def normalize_transcribe_lang(raw: str) -> str:
     """Normalize locale-like tags to supported base language codes."""
     value = (raw or "").strip()
@@ -157,6 +180,145 @@ class ClientError(BaseModel):
     source: str
     message: str
     detail: dict[str, Any] | None = None
+
+
+class BatchFormPreparePayload(BaseModel):
+    form: str
+    audioBase64: str
+    mimeType: str = "audio/webm"
+    guardrailMode: str | None = None
+    transcribeModel: str | None = None
+    structureModel: str | None = None
+
+
+class BatchFormPatchPayload(BaseModel):
+    form: str
+    currentPayload: dict[str, Any]
+    audioBase64: str | None = None
+    correctionText: str | None = None
+    mimeType: str = "audio/webm"
+    guardrailMode: str | None = None
+    transcribeModel: str | None = None
+    structureModel: str | None = None
+    previousErrors: list[str] = Field(default_factory=list)
+
+
+class BatchFormPrepareResponse(BaseModel):
+    transcript: str
+    payload: dict[str, Any] | None = None
+    reviewText: str | None = None
+    ready: bool
+    errors: list[str] = Field(default_factory=list)
+    meta: RequestMeta | None = None
+
+
+class BatchFormFillPayload(BaseModel):
+    form: str
+    payload: dict[str, Any]
+    meta: RequestMeta | None = None
+    guardrailMode: str | None = None
+
+
+@dataclass(frozen=True)
+class DecodedAudio:
+    bytes: bytes
+    mime_type: str
+    filename: str
+
+
+def decode_audio_payload(audio_base64: str, mime_type: str) -> DecodedAudio:
+    """Decode a browser MediaRecorder payload into bytes for Audio API upload."""
+    raw_mime = (mime_type or "audio/webm").split(";")[0].strip() or "audio/webm"
+    payload = audio_base64.strip()
+    if payload.startswith("data:"):
+        header, _, payload = payload.partition(",")
+        if ";base64" not in header:
+            raise ValueError("錄音資料格式不是 base64 data URL")
+        raw_mime = header.removeprefix("data:").split(";")[0] or raw_mime
+    try:
+        audio_bytes = base64.b64decode(payload, validate=True)
+    except ValueError as exc:
+        raise ValueError("錄音資料 base64 解碼失敗") from exc
+    if not audio_bytes:
+        raise ValueError("錄音內容是空的")
+    ext_by_mime = {
+        "audio/webm": "webm",
+        "audio/mp4": "mp4",
+        "audio/mpeg": "mp3",
+        "audio/mp3": "mp3",
+        "audio/wav": "wav",
+        "audio/x-wav": "wav",
+        "audio/m4a": "m4a",
+    }
+    ext = ext_by_mime.get(raw_mime, "webm")
+    return DecodedAudio(audio_bytes, raw_mime, f"recording.{ext}")
+
+
+def format_form_review(payload: dict[str, Any]) -> str:
+    """Render structured payload as a compact human-readable review block."""
+    def render_value(value: Any, indent: int = 0) -> list[str]:
+        prefix = "  " * indent
+        if isinstance(value, dict):
+            lines: list[str] = []
+            for key, inner in value.items():
+                if isinstance(inner, (dict, list)):
+                    lines.append(f"{prefix}{key}:")
+                    lines.extend(render_value(inner, indent + 1))
+                else:
+                    lines.append(f"{prefix}{key}: {inner}")
+            return lines
+        if isinstance(value, list):
+            lines = []
+            for item in value:
+                if isinstance(item, dict):
+                    first = True
+                    for key, inner in item.items():
+                        marker = "- " if first else "  "
+                        if isinstance(inner, (dict, list)):
+                            lines.append(f"{prefix}{marker}{key}:")
+                            lines.extend(render_value(inner, indent + 2))
+                        else:
+                            lines.append(f"{prefix}{marker}{key}: {inner}")
+                        first = False
+                else:
+                    lines.append(f"{prefix}- {item}")
+            return lines
+        return [f"{prefix}{value}"]
+
+    return "\n".join(render_value(payload))
+
+
+def openai_audio_error_message(exc: Exception) -> str:
+    raw = str(getattr(exc, "message", "") or exc)
+    lowered = raw.lower()
+    if "corrupted or unsupported" in lowered or "unsupported" in lowered:
+        return "錄音格式不支援、內容太短，或瀏覽器產生的音檔無法辨識。請錄 2 秒以上後再停止。"
+    if "maximum content size" in lowered or "too large" in lowered:
+        return "錄音檔太大，請縮短錄音後再試。"
+    return f"語音轉譯失敗：{raw}"
+
+
+def format_validation_errors(exc: Exception, labels: dict[str, str] | None = None) -> list[str]:
+    if not hasattr(exc, "errors"):
+        return [str(exc)]
+    messages: list[str] = []
+    for err in exc.errors():
+        loc = err.get("loc", ())
+        top_field = str(loc[0]) if loc else ""
+        label = (labels or {}).get(top_field) or top_field
+        err_type = err.get("type", "")
+        value = err.get("input")
+        if err_type == "missing":
+            messages.append(f"請填寫「{label}」")
+        elif err_type == "string_too_short" and value == "":
+            messages.append(f"請填寫「{label}」")
+        elif err_type == "string_too_short":
+            messages.append(f"「{label}」說得太簡短，請提供更多細節")
+        elif err_type == "list_too_short":
+            messages.append(f"「{label}」至少需要一筆資料")
+        else:
+            messages.append(f"「{label}」格式有誤，請重新說明")
+    return messages or [str(exc)]
 
 
 app = FastAPI(title="Speech Form Filling Demo")
@@ -584,6 +746,316 @@ DEFAULT_FORM_ID = os.getenv("DEFAULT_FORM_ID", "taxi")
 @app.get("/api/forms")
 def api_list_forms() -> list[dict[str, Any]]:
     return [skill.public_meta() for skill in list_skills()]
+
+
+def _json_schema_for_batch(skill) -> dict[str, Any]:
+    schema = skill.payload_model.model_json_schema()
+    schema.pop("title", None)
+    return schema
+
+
+async def transcribe_recording(
+    audio: DecodedAudio,
+    model: str | None = None,
+    form_hint: str | None = None,
+) -> str:
+    client = AsyncOpenAI()
+    prompt_parts: list[str] = []
+    if OPENAI_TRANSCRIBE_PROMPT:
+        prompt_parts.append(OPENAI_TRANSCRIBE_PROMPT)
+    if form_hint:
+        prompt_parts.append(form_hint)
+    params: dict[str, Any] = {
+        "model": model or OPENAI_TRANSCRIBE_MODEL,
+        "file": (audio.filename, BytesIO(audio.bytes), audio.mime_type),
+        "language": OPENAI_TRANSCRIBE_LANG,
+        "response_format": "json",
+    }
+    if prompt_parts:
+        params["prompt"] = " ".join(prompt_parts)
+    result = await client.audio.transcriptions.create(**params)
+    return (getattr(result, "text", "") or "").strip()
+
+
+async def structure_transcript_for_form(
+    form_id: str,
+    transcript: str,
+    profile_block: str,
+    model: str | None = None,
+) -> tuple[dict[str, Any], RequestMeta]:
+    skill = get_skill(form_id)
+    client = AsyncOpenAI()
+    schema = _json_schema_for_batch(skill)
+    today = datetime.now().date().isoformat()
+    prompt = (
+        "你是企業內部表單資料整理器。請把逐字稿整理成指定表單的 JSON payload。\n"
+        "規則：\n"
+        "1. 只輸出符合 JSON schema 的資料，不要輸出 markdown。\n"
+        f"2. 日期若使用者用相對日期，請以今天 {today}（Asia/Taipei）推算為 YYYY-MM-DD。\n"
+        "3. 若欄位可由使用者資料補上且逐字稿未指定，使用使用者資料；若使用者明確指定則以逐字稿為準。\n"
+        "4. 不要捏造未提及且無法合理預設的必填資訊。\n\n"
+        f"{profile_block}\n\n"
+        f"表單：{skill.label}\n"
+        f"表單說明：{skill.description}\n\n"
+        f"表單填寫規則：\n{skill.instructions}\n\n"
+        f"逐字稿：\n{transcript}"
+    )
+    completion = await client.chat.completions.create(
+        model=model or OPENAI_BATCH_STRUCTURING_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "你會把口語內容轉成可送出表單的嚴格 JSON。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": f"{form_id}_payload",
+                "schema": schema,
+                "strict": False,
+            },
+        },
+    )
+    content = completion.choices[0].message.content or "{}"
+    payload = json.loads(content)
+    usage = completion.usage
+    meta = RequestMeta()
+    if usage:
+        meta.inputTokens = usage.prompt_tokens
+        meta.outputTokens = usage.completion_tokens
+        meta.totalTokens = usage.total_tokens
+    return payload, meta
+
+
+async def patch_form_with_correction(
+    form_id: str,
+    current_payload: dict[str, Any],
+    correction: str,
+    model: str | None = None,
+    previous_errors: list[str] | None = None,
+) -> tuple[dict[str, Any], RequestMeta]:
+    skill = get_skill(form_id)
+    client = AsyncOpenAI()
+    schema = _json_schema_for_batch(skill)
+    today = datetime.now().date().isoformat()
+    error_block = ""
+    if previous_errors:
+        joined = "、".join(previous_errors)
+        error_block = f"上次驗證失敗的欄位錯誤（請根據使用者的修改指示修正這些欄位）：{joined}\n\n"
+    prompt = (
+        "你是企業內部表單資料整理器。使用者已填寫了表單草稿，現在提供了修改指示。\n"
+        "請根據修改指示調整表單資料，其餘欄位保持不變。只輸出符合 JSON schema 的完整資料，不要輸出 markdown。\n\n"
+        f"現有表單資料（JSON）：\n{json.dumps(current_payload, ensure_ascii=False, indent=2)}\n\n"
+        f"{error_block}"
+        f"使用者修改指示：\n{correction}\n\n"
+        f"今天日期：{today}（Asia/Taipei）"
+    )
+    completion = await client.chat.completions.create(
+        model=model or OPENAI_BATCH_STRUCTURING_MODEL,
+        messages=[
+            {"role": "system", "content": "你會把修改指示套用到表單草稿上，輸出完整更新後的嚴格 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": f"{form_id}_payload",
+                "schema": schema,
+                "strict": False,
+            },
+        },
+    )
+    content = completion.choices[0].message.content or "{}"
+    payload = json.loads(content)
+    usage = completion.usage
+    meta = RequestMeta()
+    if usage:
+        meta.inputTokens = usage.prompt_tokens
+        meta.outputTokens = usage.completion_tokens
+        meta.totalTokens = usage.total_tokens
+    return payload, meta
+
+
+@app.post("/api/batch-form/prepare", response_model=BatchFormPrepareResponse)
+async def prepare_batch_form(payload: BatchFormPreparePayload) -> BatchFormPrepareResponse:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="缺少 OPENAI_API_KEY")
+    if not has_skill(payload.form):
+        raise HTTPException(status_code=404, detail=f"未知的表單代號：{payload.form}")
+
+    started_at = datetime.now(timezone.utc)
+    skill = get_skill(payload.form)
+    profile = get_current_profile()
+    try:
+        audio = decode_audio_payload(payload.audioBase64, payload.mimeType)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if len(audio.bytes) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="錄音檔超過 25 MB，請縮短錄音後再試")
+
+    form_hint = f"以下是填寫「{skill.label}」表單的語音內容。{skill.description}"
+    try:
+        transcript = await transcribe_recording(audio, model=payload.transcribeModel, form_hint=form_hint)
+    except APIError as exc:
+        raise HTTPException(status_code=400, detail=openai_audio_error_message(exc)) from exc
+    if not transcript:
+        return BatchFormPrepareResponse(
+            transcript="",
+            ready=False,
+            errors=["沒有辨識到語音內容"],
+        )
+
+    if payload.guardrailMode == "keyword":
+        passed, reason = check_text_local(transcript)
+        if not passed:
+            return BatchFormPrepareResponse(
+                transcript=transcript,
+                ready=False,
+                errors=[f"Guardrail 已攔截：{reason}"],
+            )
+
+    try:
+        raw_form_payload, meta = await structure_transcript_for_form(
+            payload.form,
+            transcript,
+            profile.as_prompt_block(),
+            model=payload.structureModel,
+        )
+    except APIError as exc:
+        raise HTTPException(status_code=400, detail=f"表單整理失敗：{exc.message}") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="表單整理失敗：模型回傳不是有效 JSON") from exc
+    merged_payload = skill.merge_profile_defaults(raw_form_payload, profile)
+    errors: list[str] = []
+    ready = True
+    try:
+        parsed = skill.parse_payload(merged_payload)
+        normalized_payload = parsed.model_dump(by_alias=True)
+    except Exception as exc:
+        ready = False
+        normalized_payload = merged_payload
+        errors.extend(format_validation_errors(exc, labels=skill.field_labels()))
+
+    duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+    meta.timestamps = {"durationMs": duration_ms, "submittedAt": now_iso()}
+    return BatchFormPrepareResponse(
+        transcript=transcript,
+        payload=normalized_payload,
+        reviewText=format_form_review(normalized_payload),
+        ready=ready,
+        errors=errors,
+        meta=meta,
+    )
+
+
+@app.post("/api/batch-form/patch", response_model=BatchFormPrepareResponse)
+async def patch_batch_form(payload: BatchFormPatchPayload) -> BatchFormPrepareResponse:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="缺少 OPENAI_API_KEY")
+    if not has_skill(payload.form):
+        raise HTTPException(status_code=404, detail=f"未知的表單代號：{payload.form}")
+
+    skill = get_skill(payload.form)
+    form_hint = f"以下是填寫「{skill.label}」表單的語音修改內容。"
+    started_at = datetime.now(timezone.utc)
+    transcript = ""
+    correction_text = (payload.correctionText or "").strip()
+
+    if payload.audioBase64:
+        try:
+            audio = decode_audio_payload(payload.audioBase64, payload.mimeType)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if len(audio.bytes) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="錄音檔超過 25 MB")
+        try:
+            transcript = await transcribe_recording(audio, model=payload.transcribeModel, form_hint=form_hint)
+        except APIError as exc:
+            raise HTTPException(status_code=400, detail=openai_audio_error_message(exc)) from exc
+        correction_text = transcript
+
+    if not correction_text:
+        raise HTTPException(status_code=400, detail="請提供修改指示或錄音")
+
+    if payload.guardrailMode == "keyword":
+        passed, reason = check_text_local(correction_text)
+        if not passed:
+            return BatchFormPrepareResponse(
+                transcript=transcript,
+                ready=False,
+                errors=[f"Guardrail 已攔截：{reason}"],
+            )
+
+    try:
+        raw_form_payload, meta = await patch_form_with_correction(
+            payload.form,
+            payload.currentPayload,
+            correction_text,
+            model=payload.structureModel,
+            previous_errors=payload.previousErrors or None,
+        )
+    except APIError as exc:
+        raise HTTPException(status_code=400, detail=f"表單修改失敗：{exc.message}") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="表單修改失敗：模型回傳不是有效 JSON") from exc
+
+    profile = get_current_profile()
+    merged_payload = skill.merge_profile_defaults(raw_form_payload, profile)
+    errors: list[str] = []
+    ready = True
+    try:
+        parsed = skill.parse_payload(merged_payload)
+        normalized_payload = parsed.model_dump(by_alias=True)
+    except Exception as exc:
+        ready = False
+        normalized_payload = merged_payload
+        errors.extend(format_validation_errors(exc, labels=skill.field_labels()))
+
+    duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+    meta.timestamps = {"durationMs": duration_ms, "submittedAt": now_iso()}
+    return BatchFormPrepareResponse(
+        transcript=transcript,
+        payload=normalized_payload,
+        reviewText=format_form_review(normalized_payload),
+        ready=ready,
+        errors=errors,
+        meta=meta,
+    )
+
+
+@app.post("/api/batch-form/fill")
+async def fill_batch_form(payload: BatchFormFillPayload) -> dict[str, Any]:
+    if not has_skill(payload.form):
+        raise HTTPException(status_code=404, detail=f"未知的表單代號：{payload.form}")
+    skill = get_skill(payload.form)
+    profile = get_current_profile()
+    form_payload = skill.merge_profile_defaults(payload.payload, profile)
+    try:
+        parsed = skill.parse_payload(form_payload)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="；".join(format_validation_errors(exc, labels=skill.field_labels())),
+        ) from exc
+
+    record_payload = RequestPayload(
+        mode="stt",
+        payload=parsed.model_dump(by_alias=True),
+        meta=payload.meta,
+        guardrailMode=payload.guardrailMode,
+    )
+    record = create_request(record_payload)
+
+    page, err = await open_form_page(skill.url, skill.ready_selector)
+    if err:
+        raise HTTPException(status_code=500, detail=f"自動填表失敗：{err}")
+    try:
+        await skill.fill(page, parsed)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"填寫發生錯誤：{exc}") from exc
+    return {"status": "success", "requestId": record.id}
 
 
 @app.websocket("/ws/realtime")
@@ -1232,13 +1704,14 @@ def guardrail_info() -> dict:
         "description": "本地關鍵字檢查（Prompt injection、暴力、詐騙等）",
         "litellm_proxy": os.getenv("LITELLM_PROXY_URL", "ws://localhost:4000"),
         "transcription_model": OPENAI_TRANSCRIBE_MODEL,
+        "batch_structuring_model": OPENAI_BATCH_STRUCTURING_MODEL,
         "realtime_model": DEFAULT_REALTIME_MODEL,
     }
 
 
 @app.get("/api/models")
 def list_models() -> dict:
-    """Return available Realtime models with pricing for frontend display."""
+    """Return available models for all modes."""
     models = []
     for model_id, info in REALTIME_MODELS.items():
         models.append({
@@ -1251,7 +1724,16 @@ def list_models() -> dict:
                 "audio_output_per_1m": round(info["audio_output_per_1k"] * 1000, 2),
             },
         })
-    return {"models": models, "default": DEFAULT_REALTIME_MODEL}
+    return {
+        "models": models,
+        "default": DEFAULT_REALTIME_MODEL,
+        "batch": {
+            "transcription": BATCH_TRANSCRIPTION_MODELS,
+            "default_transcription": OPENAI_TRANSCRIBE_MODEL,
+            "structuring": BATCH_STRUCTURING_MODELS,
+            "default_structuring": OPENAI_BATCH_STRUCTURING_MODEL,
+        },
+    }
 
 
 init_db()
