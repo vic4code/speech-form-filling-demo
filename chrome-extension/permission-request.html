@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>麥克風授權</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      background: #f5f5f5;
+    }
+    .container {
+      text-align: center;
+      padding: 40px;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+      max-width: 400px;
+    }
+    .icon { font-size: 48px; margin-bottom: 16px; }
+    h2 { margin: 0 0 12px; color: #333; }
+    p { color: #666; margin: 0 0 24px; line-height: 1.5; }
+    .status { margin-top: 16px; font-size: 14px; }
+    .granted { color: #2e7d32; }
+    .denied { color: #c62828; }
+    .requesting { color: #1565c0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">🎤</div>
+    <h2>需要麥克風權限</h2>
+    <p>語音填表助理需要存取您的麥克風來進行語音辨識。<br>請在彈出的提示中點擊「允許」。</p>
+    <div class="status requesting" id="status">正在請求權限...</div>
+  </div>
+  <script src="permission-request.js"></script>
+</body>
+</html>

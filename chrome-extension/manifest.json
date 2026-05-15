@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "語音填表助理",
+  "version": "2.0.0",
+  "description": "透過 AI 語音與文字對話自動填寫網頁表單",
+  "permissions": ["sidePanel", "storage", "tabs", "activeTab", "scripting", "offscreen"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "語音填表助理",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel-hybrid.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https://api.openai.com wss://api.openai.com http://localhost:* ws://localhost:*;"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

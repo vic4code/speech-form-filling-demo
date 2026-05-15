@@ -1,0 +1,527 @@
+/* OpenAI ChatKit-inspired side panel styles - Enhanced version */
+:root {
+  --bg: #ffffff;
+  --surface: #f9f9f9;
+  --border: #e5e7eb;
+  --text: #0d0d0d;
+  --muted: #6b7280;
+  --accent: #10a37f;
+  --accent-hover: #0d8c6c;
+  --user-bg: #0d0d0d;
+  --user-text: #ffffff;
+  --agent-bg: #f4f4f4;
+  --agent-text: #0d0d0d;
+  --error: #dc2626;
+  --success: #10b981;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --font: "Inter", system-ui, -apple-system, sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  font-family: var(--font);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Header ── */
+.sp-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+.sp-logo { color: var(--accent); display: flex; align-items: center; }
+.sp-title { font-weight: 600; font-size: 14px; flex: 1; }
+.sp-icon-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 6px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  transition: background 0.15s, color 0.15s;
+}
+.sp-icon-btn:hover { background: var(--surface); color: var(--text); }
+
+/* ── Settings Drawer ── */
+.sp-settings-drawer {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.sp-settings-drawer[hidden] { display: none; }
+.sp-settings-group { display: flex; flex-direction: column; gap: 6px; }
+.sp-settings-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+.sp-flex1 { flex: 1; min-width: 0; }
+.sp-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.sp-input, .sp-select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-family: var(--font);
+  background: var(--bg);
+  transition: border-color 0.15s;
+}
+.sp-input:focus, .sp-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.sp-key-input-wrapper {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.sp-key-input-wrapper .sp-input {
+  flex: 1;
+}
+.sp-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.sp-settings-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+.sp-btn {
+  padding: 8px 16px;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.sp-btn-primary {
+  background: var(--accent);
+  color: white;
+}
+.sp-btn-primary:hover {
+  background: var(--accent-hover);
+}
+.sp-btn-secondary {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.sp-btn-secondary:hover {
+  background: var(--surface);
+}
+.sp-mini-btn {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 5px 8px;
+}
+.sp-mini-btn:hover {
+  color: var(--text);
+  background: var(--surface);
+}
+.sp-status-msg {
+  font-size: 12px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  margin-top: 4px;
+}
+.sp-status-msg.sp-status-success {
+  background: #d1fae5;
+  color: #065f46;
+}
+.sp-status-msg.sp-status-error {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+/* ── Status Chips ── */
+.sp-chips {
+  padding: 8px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.sp-status-chip {
+  font-size: 11px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sp-status-chip.sp-status-success {
+  background: #d1fae5;
+  color: #065f46;
+}
+.sp-status-chip.sp-status-error {
+  background: #fee2e2;
+  color: #991b1b;
+}
+.sp-cost-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  padding: 9px 10px;
+}
+.sp-cost-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.sp-cost-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.sp-cost-sub {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.sp-cost-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+}
+.sp-cost-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+.sp-cost-grid div {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--surface);
+}
+.sp-cost-grid span {
+  display: block;
+  font-size: 10px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.sp-cost-grid strong {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.sp-cost-history {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+.sp-history-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.sp-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+.sp-history-empty {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  text-align: center;
+}
+.sp-history-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  padding: 8px;
+}
+.sp-history-title {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-history-cost {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+}
+.sp-history-meta {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ── Chat ── */
+.sp-chat-wrapper {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.sp-chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.sp-message {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 85%;
+}
+.sp-message-user {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+.sp-message-assistant {
+  align-self: flex-start;
+  align-items: flex-start;
+}
+.sp-bubble {
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  line-height: 1.5;
+}
+.sp-message-user .sp-bubble {
+  background: var(--user-bg);
+  color: var(--user-text);
+}
+.sp-message-assistant .sp-bubble {
+  background: var(--agent-bg);
+  color: var(--agent-text);
+}
+.sp-bubble strong { font-weight: 600; }
+.sp-bubble em { font-style: italic; }
+.sp-bubble code {
+  background: rgba(0,0,0,0.05);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Monaco', 'Menlo', monospace;
+  font-size: 12px;
+}
+.sp-bubble h1, .sp-bubble h2, .sp-bubble h3 {
+  font-weight: 600;
+  margin-top: 8px;
+  margin-bottom: 4px;
+}
+
+/* ── Composer ── */
+.sp-composer {
+  border-top: 1px solid var(--border);
+  padding: 10px 14px 12px;
+  background: var(--bg);
+  flex-shrink: 0;
+}
+.sp-composer-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.sp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.sp-dot-ready { background: var(--success); }
+.sp-dot-active { background: var(--accent); animation: pulse 2s infinite; }
+.sp-dot-recording { background: var(--error); animation: pulse 1s infinite; }
+.sp-dot-error { background: var(--error); }
+.sp-dot-disconnected { background: var(--muted); }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.sp-composer-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 44px;
+  padding: 4px 5px;
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background: var(--bg);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+}
+.sp-mic-btn {
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+.sp-mic-btn:hover {
+  background: var(--surface);
+  color: var(--accent);
+}
+.sp-realtime-btn {
+  background: #0b0b0b;
+  color: #fff;
+}
+.sp-realtime-btn:hover {
+  background: #222;
+  color: #fff;
+}
+.sp-mic-stop {
+  background: var(--error);
+  color: white;
+}
+.sp-mic-stop:hover {
+  background: #b91c1c;
+}
+.sp-input-field {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 8px;
+  border: 0;
+  border-radius: 0;
+  font-size: 13px;
+  font-family: var(--font);
+  background: transparent;
+  transition: border-color 0.15s;
+}
+.sp-input-field:focus {
+  outline: none;
+}
+.sp-send-btn {
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+.sp-send-btn:hover {
+  background: var(--accent-hover);
+}
+.sp-send-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── Guardrail Chips ── */
+.sp-guardrail-chip {
+  font-size: 11px;
+  padding: 4px 10px;
+  margin: 2px 14px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 500;
+}
+.sp-guard-pass {
+  color: #2e7d32;
+  background: #e8f5e9;
+}
+.sp-guard-block {
+  color: #c62828;
+  background: #ffebee;
+}
+
+/* ── System & Error Notices ── */
+.sp-system-notice {
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+  padding: 4px 14px;
+  line-height: 1.4;
+}
+.sp-error-notice {
+  font-size: 11px;
+  color: #c62828;
+  background: #ffebee;
+  padding: 6px 12px;
+  margin: 2px 14px;
+  border-radius: 4px;
+  border-left: 3px solid #c62828;
+}
+
+/* ── Toggle Row ── */
+.sp-settings-row--between {
+  justify-content: space-between;
+}
+.sp-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.sp-toggle-label {
+  font-size: 13px;
+  color: var(--text);
+}

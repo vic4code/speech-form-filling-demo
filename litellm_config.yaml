@@ -1,4 +1,11 @@
 model_list:
+  - model_name: openai/gpt-realtime-2
+    litellm_params:
+      model: openai/gpt-realtime-2
+      api_key: os.environ/OPENAI_API_KEY
+    model_info:
+      mode: realtime
+
   - model_name: openai/gpt-4o-realtime-preview-2024-12-17
     litellm_params:
       model: openai/gpt-4o-realtime-preview-2024-12-17

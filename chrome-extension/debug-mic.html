@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>麥克風測試</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 600px;
+      margin: 50px auto;
+      padding: 20px;
+      line-height: 1.6;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      margin: 10px 5px;
+      cursor: pointer;
+      border: none;
+      border-radius: 5px;
+      background: #10a37f;
+      color: white;
+    }
+    button:hover {
+      background: #0d8c6c;
+    }
+    .status {
+      padding: 15px;
+      margin: 15px 0;
+      border-radius: 5px;
+      background: #f0f0f0;
+    }
+    .error {
+      background: #fee;
+      color: #c00;
+    }
+    .success {
+      background: #efe;
+      color: #060;
+    }
+    pre {
+      background: #f5f5f5;
+      padding: 10px;
+      border-radius: 5px;
+      overflow-x: auto;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎤 麥克風權限測試</h1>
+
+  <div id="status" class="status">等待測試...</div>
+
+  <button onclick="testPermissions()">1. 檢查權限狀態</button>
+  <button onclick="testMicrophone()">2. 測試麥克風</button>
+  <button onclick="listDevices()">3. 列出設備</button>
+
+  <h2>測試結果</h2>
+  <pre id="results"></pre>
+
+  <h2>解決方案</h2>
+  <ol>
+    <li><strong>Chrome 設定</strong>：
+      <ul>
+        <li>點擊網址列左側的 🔒 或 🛡️ 圖示</li>
+        <li>找到「麥克風」設定</li>
+        <li>選擇「允許」</li>
+        <li>重新載入頁面</li>
+      </ul>
+    </li>
+    <li><strong>系統設定（macOS）</strong>：
+      <ul>
+        <li>系統偏好設定 → 安全性與隱私權 → 隱私權</li>
+        <li>選擇「麥克風」</li>
+        <li>確認 Chrome/Edge 有勾選</li>
+      </ul>
+    </li>
+    <li><strong>Chrome Extension 設定</strong>：
+      <ul>
+        <li>到 chrome://extensions/</li>
+        <li>找到「語音填表助理」</li>
+        <li>點擊「詳細資料」</li>
+        <li>確認「網站存取權」設定正確</li>
+      </ul>
+    </li>
+  </ol>
+
+  <script>
+    const status = document.getElementById('status');
+    const results = document.getElementById('results');
+
+    function log(message) {
+      results.textContent += message + '\n';
+      console.log(message);
+    }
+
+    function setStatus(message, type = 'info') {
+      status.textContent = message;
+      status.className = 'status ' + type;
+    }
+
+    async function testPermissions() {
+      results.textContent = '';
+      log('=== 檢查權限狀態 ===\n');
+
+      try {
+        // Check if API exists
+        if (!navigator.mediaDevices) {
+          log('❌ navigator.mediaDevices 不存在');
+          log('→ 可能原因：不是 HTTPS 或 localhost');
+          setStatus('不支援麥克風 API', 'error');
+          return;
+        }
+        log('✓ navigator.mediaDevices 存在');
+
+        // Check permission API
+        if (navigator.permissions) {
+          const result = await navigator.permissions.query({ name: 'microphone' });
+          log(`✓ 權限狀態: ${result.state}`);
+          log(`  - granted: 已授權`);
+          log(`  - denied: 已拒絕`);
+          log(`  - prompt: 尚未詢問\n`);
+
+          if (result.state === 'granted') {
+            setStatus('✓ 麥克風權限已授權', 'success');
+          } else if (result.state === 'denied') {
+            setStatus('❌ 麥克風權限被拒絕', 'error');
+          } else {
+            setStatus('⚠️ 尚未請求麥克風權限', 'info');
+          }
+        } else {
+          log('⚠️ Permission API 不可用（某些瀏覽器不支援）\n');
+        }
+
+        log('下一步：點擊「2. 測試麥克風」來請求權限');
+
+      } catch (error) {
+        log(`❌ 錯誤: ${error.name} - ${error.message}`);
+        setStatus('檢查權限時發生錯誤', 'error');
+      }
+    }
+
+    async function testMicrophone() {
+      results.textContent = '';
+      log('=== 測試麥克風 ===\n');
+
+      try {
+        setStatus('正在請求麥克風權限...', 'info');
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+
+        log('✓ 成功獲得麥克風權限！');
+        log('\n音訊軌道資訊:');
+
+        const audioTrack = stream.getAudioTracks()[0];
+        log(`  Label: ${audioTrack.label}`);
+        log(`  ID: ${audioTrack.id}`);
+        log(`  Enabled: ${audioTrack.enabled}`);
+        log(`  ReadyState: ${audioTrack.readyState}`);
+
+        const settings = audioTrack.getSettings();
+        log(`\n音訊設定:`);
+        log(`  Device ID: ${settings.deviceId}`);
+        log(`  Sample Rate: ${settings.sampleRate} Hz`);
+        log(`  Sample Size: ${settings.sampleSize} bits`);
+        log(`  Channel Count: ${settings.channelCount}`);
+        log(`  Echo Cancellation: ${settings.echoCancellation}`);
+        log(`  Noise Suppression: ${settings.noiseSuppression}`);
+        log(`  Auto Gain Control: ${settings.autoGainControl}`);
+
+        setStatus('✓ 麥克風正常運作！', 'success');
+
+        // Stop the stream
+        stream.getTracks().forEach(track => track.stop());
+        log('\n已停止麥克風（測試完成）');
+
+      } catch (error) {
+        log(`❌ 錯誤: ${error.name}`);
+        log(`訊息: ${error.message}\n`);
+
+        if (error.name === 'NotAllowedError') {
+          log('→ 原因：權限被拒絕');
+          log('→ 解決：請允許麥克風權限（看上面的解決方案）');
+          setStatus('❌ 麥克風權限被拒絕', 'error');
+        } else if (error.name === 'NotFoundError') {
+          log('→ 原因：找不到麥克風設備');
+          log('→ 解決：確認麥克風已連接');
+          setStatus('❌ 找不到麥克風設備', 'error');
+        } else if (error.name === 'NotReadableError') {
+          log('→ 原因：麥克風被其他程式占用');
+          log('→ 解決：關閉其他使用麥克風的程式');
+          setStatus('❌ 麥克風被占用', 'error');
+        } else {
+          log('→ 其他錯誤，請查看 Console');
+          setStatus(`❌ 錯誤: ${error.name}`, 'error');
+        }
+      }
+    }
+
+    async function listDevices() {
+      results.textContent = '';
+      log('=== 列出媒體設備 ===\n');
+
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+
+        const audioInputs = devices.filter(d => d.kind === 'audioinput');
+        const audioOutputs = devices.filter(d => d.kind === 'audiooutput');
+        const videoInputs = devices.filter(d => d.kind === 'videoinput');
+
+        log(`音訊輸入設備（麥克風）: ${audioInputs.length} 個`);
+        audioInputs.forEach((device, i) => {
+          log(`  ${i + 1}. ${device.label || '(未授權，標籤不可見)'}`);
+          log(`     Device ID: ${device.deviceId}`);
+        });
+
+        log(`\n音訊輸出設備（喇叭）: ${audioOutputs.length} 個`);
+        audioOutputs.forEach((device, i) => {
+          log(`  ${i + 1}. ${device.label || '(未授權，標籤不可見)'}`);
+        });
+
+        log(`\n視訊輸入設備（相機）: ${videoInputs.length} 個`);
+        videoInputs.forEach((device, i) => {
+          log(`  ${i + 1}. ${device.label || '(未授權，標籤不可見)'}`);
+        });
+
+        if (audioInputs.length === 0) {
+          log('\n⚠️ 沒有找到麥克風設備');
+          setStatus('⚠️ 沒有麥克風設備', 'error');
+        } else if (audioInputs.every(d => !d.label)) {
+          log('\n⚠️ 設備標籤不可見（需要先授權麥克風權限）');
+          setStatus('請先點擊「2. 測試麥克風」來授權', 'info');
+        } else {
+          setStatus(`✓ 找到 ${audioInputs.length} 個麥克風設備`, 'success');
+        }
+
+      } catch (error) {
+        log(`❌ 錯誤: ${error.name} - ${error.message}`);
+        setStatus('列出設備時發生錯誤', 'error');
+      }
+    }
+
+    // Auto-run on load
+    window.addEventListener('load', () => {
+      log('頁面載入完成。請點擊按鈕開始測試。\n');
+      testPermissions();
+    });
+  </script>
+</body>
+</html>

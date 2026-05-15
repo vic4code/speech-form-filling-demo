@@ -1,13 +1,15 @@
 # Speech Form Filling Demo
 
-Voice-driven assistant that fills internal HR / IT forms via OpenAI Realtime API + Playwright. Talk to the agent, it asks only what it doesn't already know, then opens the real form in Chrome and fills it for you to review and submit.
+Voice-driven assistant that fills internal HR / IT forms via OpenAI Realtime API + Playwright. Use either live realtime conversation or record a complete request, batch-transcribe it, and review the structured form payload before the browser is filled.
 
 ## What it does
 
 1. Pick a form from the dropdown (`計程車費請領單`, `資訊作業申請`, `【金控】筆電申請單` — extensible)
-2. Talk to the AI agent (繁體中文). It asks only the fields it can't pre-fill
+2. Choose a voice mode:
+   - `即時對話`: talk to the AI agent (繁體中文). It asks only the fields it can't pre-fill
+   - `錄音整理`: record the whole request, batch-transcribe it with `gpt-4o-transcribe`, then review the formatted form payload
 3. Personal info (name / 員編 / e-mail / 部門 ...) is **auto-filled from the logged-in user profile** — the agent never asks for it
-4. When all fields are confirmed, the agent calls `submit_form` → backend launches Chrome via Playwright (persistent profile, login persists), navigates to the real form, fills every field
+4. When all fields are confirmed, the agent or batch confirmation calls the backend → Chrome opens via Playwright (persistent profile, login persists), navigates to the real form, fills every field
 5. **The agent does NOT click submit.** You review the filled form and click 送出 yourself
 6. All sessions logged to `/logs.html` with token usage, cost, and full WebSocket event timeline
 
@@ -151,6 +153,7 @@ uv run python scripts/test_fill.py taxi          # or it_request / laptop
 
 | Model | Text In/Out (per 1M) | Audio In/Out (per 1M) |
 |---|---|---|
+| `gpt-realtime-2` | $4.00 / $24.00 | $32.00 / $64.00 |
 | `gpt-4o-realtime-preview-2024-12-17` | $5.50 / $22.00 | $44.00 / $80.00 |
 | `gpt-4o-realtime-preview-2024-10-01` | $5.50 / $22.00 | $110.00 / $220.00 |
 | `gpt-4o-mini-realtime-preview-2024-12-17` | $0.66 / $2.64 | $11.00 / $22.00 |
@@ -164,8 +167,9 @@ Selectable from the model dropdown in the UI.
 | `OPENAI_API_KEY` | — (required) | Used by LiteLLM proxy to talk to OpenAI |
 | `LITELLM_MASTER_KEY` | — (required) | Auth between FastAPI and LiteLLM |
 | `LITELLM_PROXY_URL` | `ws://localhost:4000` | LiteLLM Realtime endpoint base URL |
-| `OPENAI_REALTIME_MODEL` | `gpt-4o-realtime-preview-2024-12-17` | Default Realtime model |
-| `OPENAI_TRANSCRIBE_MODEL` | `whisper-1` | Whisper model for input transcription |
+| `OPENAI_REALTIME_MODEL` | `gpt-realtime-2` | Default Realtime model |
+| `OPENAI_TRANSCRIBE_MODEL` | `gpt-4o-transcribe` | Audio transcription model for realtime input transcription and batch recording mode |
+| `OPENAI_BATCH_STRUCTURING_MODEL` | `gpt-4.1` | Text model that converts batch transcripts into form payload JSON |
 | `OPENAI_TRANSCRIBE_LANG` | `zh` | Transcription language code |
 | `OPENAI_TRANSCRIBE_PROMPT` | (empty) | Whisper prompt for domain terms |
 | `DEFAULT_FORM_ID` | `taxi` | Form selected on first page load |
@@ -187,6 +191,8 @@ Selectable from the model dropdown in the UI.
 | `GET` | `/api/models` | Available Realtime models with pricing |
 | `GET` | `/api/guardrail-info` | Guardrail config summary (for UI display) |
 | `POST` | `/api/requests` | Persist a submitted form record |
+| `POST` | `/api/batch-form/prepare` | Batch recording mode: transcribe one recording and return a formatted form payload for user confirmation |
+| `POST` | `/api/batch-form/fill` | Fill the selected browser form after the user confirms the batch payload |
 | `GET` | `/api/requests` | List all submitted records |
 | `GET` | `/api/requests/:id` | Single record detail |
 | `DELETE` | `/api/requests/:id` | Delete a record |

@@ -28,6 +28,7 @@ from app.guardrails import check_text_local
 from app.browser import open_form_page
 from app.forms import get_skill, has_skill, list_skills
 from app.profile import get_current_profile
+from app.byok import BYOKWebSocketProxy, WhisperBYOKRequest, transcribe_with_byok
 
 
 load_dotenv()
@@ -1750,3 +1751,131 @@ def serve_logs() -> FileResponse:
 
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ── BYOK (Bring Your Own Key) Endpoints for Chrome Extension ──
+
+@app.websocket("/ws/byok-realtime")
+async def byok_realtime_websocket(
+    websocket: WebSocket,
+    model: str = "gpt-realtime-2",
+    guardrail: str | None = None
+):
+    """
+    WebSocket proxy for Realtime API with user's own API key.
+
+    The client must send their API key in the first message:
+    {
+        "type": "auth",
+        "api_key": "sk-proj-..."
+    }
+
+    Then all subsequent messages are proxied to LiteLLM with guardrail checks.
+    """
+    await websocket.accept()
+
+    try:
+        # Wait for auth message with API key
+        auth_msg = await websocket.receive_json()
+
+        if auth_msg.get("type") != "auth":
+            await websocket.send_json({
+                "type": "error",
+                "error": "First message must be auth with api_key"
+            })
+            await websocket.close()
+            return
+
+        user_api_key = auth_msg.get("api_key")
+        if not user_api_key or not user_api_key.startswith("sk-"):
+            await websocket.send_json({
+                "type": "error",
+                "error": "Invalid API key format"
+            })
+            await websocket.close()
+            return
+
+        # Send auth success
+        await websocket.send_json({
+            "type": "auth_success",
+            "message": "Connected to enterprise mode with guardrail"
+        })
+
+        # Build LiteLLM URL
+        litellm_url = _realtime_url(model)
+
+        # Create proxy with guardrail
+        guardrail_enabled = (guardrail == "keyword")
+        proxy = BYOKWebSocketProxy(
+            client_ws=websocket,
+            user_api_key=user_api_key,
+            litellm_url=litellm_url,
+            guardrail_enabled=guardrail_enabled,
+            pricing=_get_model_pricing(model),
+        )
+
+        # Run proxy
+        await proxy.run()
+
+    except WebSocketDisconnect:
+        print("Client disconnected from BYOK Realtime")
+    except Exception as e:
+        print(f"BYOK Realtime error: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "error": str(e)
+            })
+        except:
+            pass
+
+
+@app.post("/api/byok-transcribe")
+async def byok_transcribe(request: WhisperBYOKRequest) -> dict[str, Any]:
+    """
+    Transcribe audio using user's own API key with optional guardrail.
+
+    This is for personal mode (direct frontend call) or enterprise mode
+    (frontend -> backend with guardrail).
+    """
+    return await transcribe_with_byok(request)
+
+
+@app.get("/api/connection-modes")
+def get_connection_modes() -> dict[str, Any]:
+    """
+    Return available connection modes for Chrome Extension.
+    """
+    return {
+        "modes": [
+            {
+                "id": "enterprise",
+                "label": "企業模式（有 Guardrail）",
+                "description": "所有請求經過後端檢查，支援即時對話和錄音兩種模式",
+                "features": [
+                    "✓ Guardrail 保護",
+                    "✓ 日誌記錄",
+                    "✓ 即時對話（Realtime API）",
+                    "✓ 錄音轉譯（Whisper API）"
+                ],
+                "requires_backend": True,
+                "websocket_url": "/ws/byok-realtime",
+                "transcribe_url": "/api/byok-transcribe"
+            },
+            {
+                "id": "personal",
+                "label": "個人模式（純前端）",
+                "description": "直接調用 OpenAI API，無 guardrail 檢查",
+                "features": [
+                    "✓ 無需後端伺服器",
+                    "✓ 更低延遲",
+                    "✓ 錄音轉譯（Whisper API）",
+                    "✗ 無 Guardrail",
+                    "✗ 不支援即時對話"
+                ],
+                "requires_backend": False,
+                "direct_api": True
+            }
+        ],
+        "default": "enterprise"
+    }
