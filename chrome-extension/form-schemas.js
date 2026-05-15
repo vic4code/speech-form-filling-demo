@@ -18,14 +18,15 @@ const FORM_SCHEMAS = {
 5. 車資合計（可以自己從 rideRows 的 fee 加總計算）
 
 重要規則：
-- 使用者一次把資訊說完就直接填，不需要逐一確認
+- 使用者一次把所有必填資訊說完才可以直接填，不需要逐一確認
+- 不可自行編造使用者沒提供的日期、地點、費用或事由
 - 日期格式必須是 YYYY-MM-DD（例：今天是2026-05-15）
 - 費用必須是純數字字串
 - 車資合計 = 所有趟次的 fee 加總，你可以自己算不需要問使用者
 - 乘車時段沒提到就預設 01_平日(08~21)
 - 來回就是 02_單日來回，兩筆 rideRows（去程跟回程）
 - 如果使用者說「來回」且每趟150，就自動產生兩筆 rideRows 並算合計300
-- 使用者說「確認沒問題幫我送出」這類話表示所有資訊都說完了，直接呼叫 fill_form`,
+- 使用者說「確認沒問題幫我送出」但必填資訊不足時，仍然要追問缺少內容`,
     toolSchema: {
       type: 'function',
       function: {
@@ -93,39 +94,44 @@ const FORM_SCHEMAS = {
 3. 使用者姓名
 4. 申請方案（標準/進階/高階）
 
-缺少資訊務必追問，全部完整才能呼叫 fill_form。`,
+重要規則：
+- fill_form 的 key 必須用中文欄位名，對應表單上的欄位標籤
+- 需求類型是 checkbox，值用逗號分隔
+- 使用者一次說完所有必填資訊才可以直接填，不需逐一確認
+- 不可自行編造使用者沒提供的姓名、需求或方案
+- 缺少資訊務必追問，全部完整才能呼叫 fill_form`,
     toolSchema: {
       type: 'function',
       function: {
         name: 'fill_form',
-        description: '當所有必填欄位完整時，填入筆電申請單。',
+        description: '當所有必填欄位完整時，填入筆電申請單。key 必須使用中文欄位名稱以對應表單標籤。',
         parameters: {
           type: 'object',
           properties: {
-            needs: {
+            '需求類型': {
               type: 'array',
               items: {
                 type: 'string',
-                enum: ['external_device', 'design_video', 'overseas', 'high_resource', 'none']
+                enum: ['需外接特殊設備', '設計/影片剪輯', '海外出差', '高資源軟體', '以上皆無']
               },
-              description: '需求類型：external_device=外接設備、design_video=設計/剪輯、overseas=海外出差、high_resource=高資源、none=皆無'
+              description: '需求類型（可複選）'
             },
-            applicantIsUser: {
+            '是否本人使用': {
               type: 'string',
-              enum: ['yes', 'no'],
-              description: '是否本人使用：yes=是、no=代他人'
+              enum: ['是', '否'],
+              description: '是否申請者本人使用'
             },
-            name: {
+            '使用者姓名': {
               type: 'string',
               description: '使用者姓名'
             },
-            plan: {
+            '申請方案': {
               type: 'string',
-              enum: ['standard', 'advanced', 'high'],
+              enum: ['標準', '進階', '高階'],
               description: '申請方案'
             }
           },
-          required: ['needs', 'applicantIsUser', 'name', 'plan']
+          required: ['需求類型', '是否本人使用', '使用者姓名', '申請方案']
         }
       }
     }
@@ -140,28 +146,34 @@ const FORM_SCHEMAS = {
 回覆簡短扼要，每次不超過兩句。
 
 必填欄位：
-1. 申請者姓名
-2. 申請原因
-3. 需求說明
-4. 作業時段
-5. 作業人員
+1. 申請者（姓名，純文字）
+2. 作業原因（純文字描述，例：「系統維護」「資料備份」）
+3. 需求說明（純文字描述，詳細說明需要做什麼）
+4. 申請起始時間及終止時間（純文字，例：「2026-05-15 09:00-12:00」或「週一上午」）
+5. 作業人員（姓名，純文字）
 
-缺少資訊務必追問，全部完整才能呼叫 fill_form。`,
+重要規則：
+- fill_form 的 key 必須用中文欄位名（申請者、作業原因、需求說明、申請起始時間及終止時間、作業人員）
+- 所有欄位都是純文字輸入，直接填入使用者說的內容即可
+- 使用者一次說完所有必填資訊才可以直接填，不需逐一確認
+- 不可自行編造使用者沒提供的姓名、作業原因、需求、時間或作業人員
+- 不要拒絕填寫文字型欄位，使用者提供什麼就填什麼
+- 缺少資訊務必追問，全部完整才能呼叫 fill_form`,
     toolSchema: {
       type: 'function',
       function: {
         name: 'fill_form',
-        description: '當所有必填欄位完整時，填入資訊作業申請單。',
+        description: '當所有必填欄位完整時，填入資訊作業申請單。key 必須使用中文欄位名稱以對應表單標籤。',
         parameters: {
           type: 'object',
           properties: {
-            applicant: { type: 'string', description: '申請者姓名' },
-            reason: { type: 'string', description: '申請原因' },
-            requirement: { type: 'string', description: '需求說明' },
-            timeSlot: { type: 'string', description: '作業時段' },
-            operator: { type: 'string', description: '作業人員' }
+            '申請者': { type: 'string', description: '申請者姓名' },
+            '作業原因': { type: 'string', description: '作業原因' },
+            '需求說明': { type: 'string', description: '需求說明' },
+            '申請起始時間及終止時間': { type: 'string', description: '申請起始時間及終止時間' },
+            '作業人員': { type: 'string', description: '作業人員' }
           },
-          required: ['applicant', 'reason', 'requirement', 'timeSlot', 'operator']
+          required: ['申請者', '作業原因', '需求說明', '申請起始時間及終止時間', '作業人員']
         }
       }
     }

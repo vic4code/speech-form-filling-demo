@@ -317,7 +317,7 @@ async function startRecording() {
           return;
         }
 
-        addMessage('user', `🎤 ${transcript}`);
+        addMessage('user', `${transcript}`);
         await handleUserMessage(transcript);
       } catch (error) {
         console.error('Transcription error:', error);

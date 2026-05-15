@@ -1810,7 +1810,8 @@ async def byok_realtime_websocket(
             client_ws=websocket,
             user_api_key=user_api_key,
             litellm_url=litellm_url,
-            guardrail_enabled=guardrail_enabled
+            guardrail_enabled=guardrail_enabled,
+            pricing=_get_model_pricing(model),
         )
 
         # Run proxy

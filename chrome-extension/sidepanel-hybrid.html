@@ -21,21 +21,6 @@
     <!-- ── Settings drawer ── -->
     <div class="sp-settings-drawer" id="settings-drawer" hidden>
       <div class="sp-settings-group">
-        <label class="sp-label">連接模式</label>
-        <select id="connection-mode" class="sp-select">
-          <option value="enterprise">企業模式（有 Guardrail）</option>
-          <option value="personal">個人模式（純前端）</option>
-        </select>
-        <p class="sp-hint" id="mode-description">企業模式：所有請求經過後端檢查</p>
-      </div>
-
-      <div class="sp-settings-group" id="backend-url-group">
-        <label class="sp-label">後端伺服器</label>
-        <input id="backend-url" class="sp-input" type="url" placeholder="http://localhost:8000" />
-        <p class="sp-hint">企業模式需要後端伺服器</p>
-      </div>
-
-      <div class="sp-settings-group">
         <label class="sp-label">OpenAI API Key</label>
         <div class="sp-key-input-wrapper">
           <input id="api-key-input" class="sp-input" type="password" placeholder="sk-proj-..." />
@@ -46,38 +31,22 @@
         <p class="sp-hint">Your API key is stored locally in your browser</p>
       </div>
 
-      <div class="sp-settings-group">
-        <label class="sp-label">語音模式</label>
-        <select id="voice-mode" class="sp-select">
-          <option value="realtime">即時對話（Realtime API）</option>
-          <option value="whisper">錄音轉譯（Whisper API）</option>
-        </select>
-        <p class="sp-hint" id="voice-mode-hint">即時對話：AI 串流回應，自動填表</p>
-      </div>
-
-      <div class="sp-settings-row">
-        <div class="sp-settings-group sp-flex1" id="realtime-model-group">
-          <label class="sp-label">Realtime 模型</label>
-          <select id="realtime-model-select" class="sp-select">
-            <option value="gpt-realtime-2">GPT Realtime 2</option>
-            <option value="gpt-4o-realtime-preview-2024-12-17">GPT-4o Realtime</option>
-          </select>
-        </div>
-        <div class="sp-settings-group sp-flex1" id="whisper-model-group" style="display:none">
-          <label class="sp-label">轉錄模型</label>
-          <select id="whisper-model-select" class="sp-select">
-            <option value="gpt-4o-transcribe">GPT-4o Transcribe</option>
-            <option value="gpt-4o-mini-transcribe">GPT-4o Mini Transcribe</option>
-            <option value="whisper-1">Whisper 1</option>
-          </select>
-        </div>
-      </div>
-
       <div class="sp-settings-row sp-settings-row--between">
         <label class="sp-toggle-row" id="guardrail-toggle-row">
           <input type="checkbox" id="guardrail-enabled" checked />
           <span class="sp-toggle-label">Guardrail</span>
         </label>
+      </div>
+
+      <div class="sp-settings-group sp-cost-history">
+        <div class="sp-history-head">
+          <div>
+            <label class="sp-label">成本歷史</label>
+            <p class="sp-hint" id="cost-history-summary">尚無歷史紀錄</p>
+          </div>
+          <button class="sp-mini-btn" id="clear-cost-history" type="button">清除</button>
+        </div>
+        <div class="sp-history-list" id="cost-history-list"></div>
       </div>
 
       <div class="sp-settings-actions">
@@ -90,8 +59,27 @@
     <!-- ── Status chips ── -->
     <div class="sp-chips">
       <div id="mode-chip" class="sp-status-chip">
-        <span id="mode-chip-text">企業模式 + Guardrail</span>
+        <span id="mode-chip-text">本機 Guardrail 已啟用</span>
       </div>
+      <section class="sp-cost-panel" id="cost-panel">
+        <div class="sp-cost-main">
+          <div>
+            <div class="sp-cost-label">本次成本</div>
+            <div class="sp-cost-sub" id="cost-subtitle">尚未產生 usage</div>
+          </div>
+          <div class="sp-cost-value" id="cost-total">$0.000000</div>
+        </div>
+        <div class="sp-cost-grid">
+          <div>
+            <span>文字</span>
+            <strong id="cost-text-tokens">0 / 0</strong>
+          </div>
+          <div>
+            <span>音訊</span>
+            <strong id="cost-audio-tokens">0 / 0</strong>
+          </div>
+        </div>
+      </section>
       <div id="api-status" class="sp-status-chip" style="display:none">
         <span id="api-status-text"></span>
       </div>
@@ -109,13 +97,16 @@
         <span class="sp-status-text" id="status-text">Ready</span>
       </div>
       <div class="sp-composer-row">
-        <button class="sp-mic-btn" id="btn-start" title="開始語音" aria-label="開始語音">
+        <button class="sp-mic-btn" id="btn-record" title="錄音轉文字" aria-label="錄音轉文字">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="22"/></svg>
         </button>
-        <button class="sp-mic-btn sp-mic-stop" id="btn-stop" title="停止" aria-label="停止" style="display:none">
+        <button class="sp-mic-btn sp-realtime-btn" id="btn-realtime" title="即時語音對話" aria-label="即時語音對話">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="4" y="9" width="2.5" height="6" rx="1.25"/><rect x="8.5" y="5" width="2.5" height="14" rx="1.25"/><rect x="13" y="7" width="2.5" height="10" rx="1.25"/><rect x="17.5" y="3" width="2.5" height="18" rx="1.25"/></svg>
+        </button>
+        <button class="sp-mic-btn sp-mic-stop" id="btn-stop" title="停止語音" aria-label="停止語音" style="display:none">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
         </button>
-        <input id="chat-input" class="sp-input-field" placeholder="輸入或按麥克風開始語音…" />
+        <input id="chat-input" class="sp-input-field" placeholder="輸入表單資訊或問題…" />
         <button class="sp-send-btn" id="btn-send" title="送出" aria-label="送出">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
         </button>

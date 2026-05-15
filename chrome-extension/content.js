@@ -17,6 +17,24 @@ function normalizeText(s) {
   return (s || "").toLowerCase().replace(/[\s_\-　]/g, "").replace(/[（(]/g, "(").replace(/[）)]/g, ")");
 }
 
+const FIELD_LABEL_ALIASES = {
+  '申請原因': ['作業原因', '申請原因'],
+  '作業原因': ['作業原因', '申請原因'],
+  '作業時段': ['申請起始時間', '終止時間', '作業時段'],
+  '申請時間': ['申請起始時間', '終止時間', '作業時段'],
+  '申請起始時間及終止時間': ['申請起始時間', '終止時間', '作業時段'],
+  reason: ['作業原因', '申請原因'],
+  requirement: ['需求說明'],
+  timeRange: ['申請起始時間', '終止時間', '作業時段'],
+  operator: ['作業人員'],
+  applicant: ['申請者']
+};
+
+function labelCandidates(key) {
+  const raw = String(key || "");
+  return [raw, ...(FIELD_LABEL_ALIASES[raw] || [])].filter(Boolean);
+}
+
 function getLabelForEl(el) {
   if (el.id) {
     const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
@@ -151,6 +169,21 @@ function findXZWebRow(labelKeyword) {
   return null;
 }
 
+function findXZWebRowForKey(key) {
+  for (const label of labelCandidates(key)) {
+    const row = findXZWebRow(label);
+    if (row) return row;
+  }
+  return null;
+}
+
+function getPrimaryTextControl(row) {
+  return row.querySelector('textarea')
+    || row.querySelector('input[type="text"]')
+    || row.querySelector('input[type="date"]')
+    || row.querySelector('input:not([type=hidden]):not([type=radio]):not([type=checkbox])');
+}
+
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -236,7 +269,7 @@ async function fillXZWebForm(payload) {
       } else if (key === 'notes') {
         const row = findXZWebRow('備註');
         if (row) {
-          const inp = row.querySelector('input[type="text"]') || row.querySelector('textarea');
+          const inp = getPrimaryTextControl(row);
           if (inp) {
             triggerReactChange(inp, value);
             results.filled.push(key);
@@ -245,10 +278,70 @@ async function fillXZWebForm(payload) {
         }
 
       } else {
-        // Generic fallback: try to match by label
-        const filled = fillGenericField(key, value);
-        if (filled) results.filled.push(key);
-        else results.failed.push({ key, reason: 'field not found' });
+        // Try XZWeb row match by key as label keyword
+        const row = findXZWebRowForKey(key);
+        if (row) {
+          // Checkbox group (array value)
+          if (Array.isArray(value)) {
+            const checkboxes = row.querySelectorAll('input[type="checkbox"]');
+            if (checkboxes.length > 0) {
+              for (const cb of checkboxes) {
+                const cbLabel = getLabelForEl(cb) || cb.value;
+                if (value.some(v => cbLabel.includes(v) || cb.value.includes(v))) {
+                  if (!cb.checked) { cb.click(); await sleep(200); }
+                }
+              }
+              results.filled.push(key);
+              await sleep(300);
+            } else {
+              results.failed.push({ key, reason: 'no checkboxes in row' });
+            }
+          } else {
+            // Radio group
+            const radios = row.querySelectorAll('input[type="radio"]');
+            if (radios.length > 0) {
+              let found = false;
+              for (const r of radios) {
+                const rLabel = getLabelForEl(r) || r.value;
+                if (rLabel.includes(String(value)) || r.value === String(value)) {
+                  r.click(); found = true; await sleep(300); break;
+                }
+              }
+              if (found) results.filled.push(key);
+              else results.failed.push({ key, reason: `no radio matching "${value}"` });
+            } else {
+              // Text input / textarea
+              const inp = getPrimaryTextControl(row);
+              if (inp) {
+                triggerReactChange(inp, String(value));
+                results.filled.push(key);
+                await sleep(300);
+              } else {
+                // Dropdown
+                const trigger = row.querySelector('.dropdown-menu-title');
+                if (trigger) {
+                  trigger.click(); await sleep(300);
+                  const items = row.querySelectorAll('.dropdown-item');
+                  let found = false;
+                  for (const item of items) {
+                    if ((item.getAttribute('value') || item.textContent.trim()).includes(String(value))) {
+                      item.click(); found = true; await sleep(300); break;
+                    }
+                  }
+                  if (found) results.filled.push(key);
+                  else results.failed.push({ key, reason: `no dropdown item matching "${value}"` });
+                } else {
+                  results.failed.push({ key, reason: 'input not found in row' });
+                }
+              }
+            }
+          }
+        } else {
+          // Generic fallback
+          const filled = fillGenericField(key, value);
+          if (filled) results.filled.push(key);
+          else results.failed.push({ key, reason: 'field not found' });
+        }
       }
     } catch (e) {
       results.failed.push({ key, reason: e.message });

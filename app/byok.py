@@ -31,13 +31,23 @@ class BYOKWebSocketProxy:
         client_ws: WebSocket,
         user_api_key: str,
         litellm_url: str,
-        guardrail_enabled: bool = True
+        guardrail_enabled: bool = True,
+        pricing: dict[str, float] | None = None,
     ):
         self.client_ws = client_ws
         self.user_api_key = user_api_key
         self.litellm_url = litellm_url
         self.guardrail_enabled = guardrail_enabled
         self.backend_ws = None
+        self._response_active = False
+        self._manual_response_mode = False
+        self._output_buffer = ""
+        self._output_blocked = False
+        self._pricing = pricing or {}
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._total_audio_input_tokens = 0
+        self._total_audio_output_tokens = 0
 
     async def connect_to_backend(self):
         """Connect to LiteLLM proxy with user's API key"""
@@ -47,7 +57,7 @@ class BYOKWebSocketProxy:
         }
         self.backend_ws = await websockets.connect(
             self.litellm_url,
-            extra_headers=headers
+            additional_headers=headers,
         )
 
     async def forward_client_to_backend(self):
@@ -57,13 +67,20 @@ class BYOKWebSocketProxy:
                 message = await self.client_ws.receive_text()
                 data = json.loads(message)
 
-                # Apply input guardrail
                 if self.guardrail_enabled:
-                    if await self._check_input_guardrail(data):
-                        # Blocked by guardrail
+                    self._force_manual_response_after_guardrail(data)
+
+                # Apply input guardrail for text messages.
+                if self.guardrail_enabled:
+                    blocked, reason, snippet = await self._check_input_guardrail(data)
+                    if blocked:
+                        print(f"[BYOK guardrail] INPUT BLOCKED: {reason} text={snippet!r}")
                         await self.client_ws.send_json({
-                            "type": "error",
-                            "error": "Input blocked by guardrail"
+                            "type": "guardrail_chat",
+                            "passed": False,
+                            "side": "input",
+                            "snippet": snippet,
+                            "reason": reason,
                         })
                         continue
 
@@ -72,6 +89,7 @@ class BYOKWebSocketProxy:
 
         except Exception as e:
             print(f"Error in forward_client_to_backend: {e}")
+            await self._close_backend()
 
     async def forward_backend_to_client(self):
         """Forward messages from backend to client with guardrail"""
@@ -79,27 +97,81 @@ class BYOKWebSocketProxy:
             while True:
                 message = await self.backend_ws.recv()
                 data = json.loads(message)
+                event_type = data.get("type", "")
 
-                # Apply output guardrail
+                if event_type == "response.created":
+                    self._response_active = True
+                    self._output_buffer = ""
+                    self._output_blocked = False
+                elif event_type in ("response.done", "response.cancelled"):
+                    self._response_active = False
+                elif self._output_blocked and event_type.startswith("response."):
+                    continue
+
+                if event_type == "response.done":
+                    await self._emit_cost_update(data)
+
                 if self.guardrail_enabled:
-                    if await self._check_output_guardrail(data):
-                        # Blocked by guardrail - cancel response
-                        await self.backend_ws.send(json.dumps({
-                            "type": "response.cancel"
-                        }))
+                    blocked, reason, snippet = await self._check_backend_guardrail(data)
+                    if blocked:
+                        print(f"[BYOK guardrail] BLOCKED: {reason} text={snippet!r}")
+                        if self._response_active:
+                            await self.backend_ws.send(json.dumps({"type": "response.cancel"}))
+                        await self.client_ws.send_json({"type": "playback_stop"})
                         await self.client_ws.send_json({
-                            "type": "error",
-                            "error": "Output blocked by guardrail"
+                            "type": "guardrail_chat",
+                            "passed": False,
+                            "side": "output" if event_type.startswith("response.") else "input",
+                            "snippet": snippet,
+                            "reason": reason,
                         })
                         continue
+                    if (
+                        event_type == "conversation.item.input_audio_transcription.completed"
+                        and self._manual_response_mode
+                    ):
+                        await self.client_ws.send_json({
+                            "type": "guardrail_chat",
+                            "passed": True,
+                            "side": "input",
+                        })
+                        await self.backend_ws.send(json.dumps({"type": "response.create"}))
 
                 # Forward to client
                 await self.client_ws.send_text(message)
 
         except Exception as e:
             print(f"Error in forward_backend_to_client: {e}")
+            await self._close_backend()
 
-    async def _check_input_guardrail(self, data: dict) -> bool:
+    def _force_manual_response_after_guardrail(self, data: dict) -> None:
+        """Disable Realtime auto-response so audio transcripts can be checked first."""
+        if data.get("type") != "session.update":
+            return
+        session = data.setdefault("session", {})
+        # The current GA Realtime schema rejects top-level session.voice.
+        # Strip it defensively; GA clients should use audio.output.voice instead.
+        session.pop("voice", None)
+        manual_mode = False
+
+        turn_detection = session.get("turn_detection")
+        if isinstance(turn_detection, dict) and turn_detection.get("type") == "server_vad":
+            turn_detection["create_response"] = False
+            manual_mode = True
+
+        audio_input = ((session.get("audio") or {}).get("input") or {})
+        nested_turn_detection = audio_input.get("turn_detection")
+        if (
+            isinstance(nested_turn_detection, dict)
+            and nested_turn_detection.get("type") == "server_vad"
+        ):
+            nested_turn_detection["create_response"] = False
+            manual_mode = True
+
+        if manual_mode:
+            self._manual_response_mode = True
+
+    async def _check_input_guardrail(self, data: dict) -> tuple[bool, str, str]:
         """
         Check if input should be blocked
         Returns True if blocked
@@ -107,45 +179,100 @@ class BYOKWebSocketProxy:
         # Check user input text
         if data.get("type") == "input_audio_buffer.append":
             # For audio, we can't check until it's transcribed
-            return False
+            return False, "", ""
 
         if data.get("type") == "conversation.item.create":
             item = data.get("item", {})
             for content in item.get("content", []):
                 if content.get("type") == "input_text":
                     text = content.get("text", "")
-                    if check_text_local(text):
-                        return True
+                    passed, reason = check_text_local(text)
+                    if not passed:
+                        return True, reason, text[:160]
 
-        return False
+        return False, "", ""
 
-    async def _check_output_guardrail(self, data: dict) -> bool:
+    def _current_meta(self) -> dict[str, Any]:
+        text_cost = (
+            (self._total_input_tokens / 1000) * self._pricing.get("text_input_per_1k", 0)
+            + (self._total_output_tokens / 1000) * self._pricing.get("text_output_per_1k", 0)
+        )
+        audio_cost = (
+            (self._total_audio_input_tokens / 1000) * self._pricing.get("audio_input_per_1k", 0)
+            + (self._total_audio_output_tokens / 1000) * self._pricing.get("audio_output_per_1k", 0)
+        )
+        return {
+            "inputTokens": self._total_input_tokens,
+            "outputTokens": self._total_output_tokens,
+            "totalTokens": self._total_input_tokens + self._total_output_tokens,
+            "audioInputTokens": self._total_audio_input_tokens,
+            "audioOutputTokens": self._total_audio_output_tokens,
+            "cost": round(text_cost + audio_cost, 6),
+        }
+
+    async def _emit_cost_update(self, data: dict) -> None:
+        response = data.get("response") or {}
+        usage = response.get("usage") or {}
+        self._total_input_tokens += usage.get("input_tokens", 0) or 0
+        self._total_output_tokens += usage.get("output_tokens", 0) or 0
+        in_det = usage.get("input_token_details") or {}
+        out_det = usage.get("output_token_details") or {}
+        self._total_audio_input_tokens += in_det.get("audio_tokens", 0) or 0
+        self._total_audio_output_tokens += out_det.get("audio_tokens", 0) or 0
+        await self.client_ws.send_json({
+            "type": "cost_update",
+            "meta": self._current_meta(),
+        })
+
+    async def _check_backend_guardrail(self, data: dict) -> tuple[bool, str, str]:
         """
         Check if output should be blocked
         Returns True if blocked
         """
-        # Check assistant output
-        if data.get("type") == "response.audio_transcript.delta":
-            transcript = data.get("delta", "")
-            if check_text_local(transcript):
-                return True
+        event_type = data.get("type", "")
 
-        if data.get("type") == "response.text.delta":
-            text = data.get("delta", "")
-            if check_text_local(text):
-                return True
+        if event_type == "conversation.item.input_audio_transcription.completed":
+            transcript = data.get("transcript") or data.get("text") or ""
+            passed, reason = check_text_local(transcript)
+            if not passed:
+                return True, reason, transcript[:160]
 
-        return False
+        if event_type in (
+            "response.audio_transcript.delta",
+            "response.text.delta",
+            "response.output_text.delta",
+        ):
+            self._output_buffer += data.get("delta", "")
+            passed, reason = check_text_local(self._output_buffer)
+            if not passed:
+                self._output_blocked = True
+                return True, reason, self._output_buffer[:160]
+
+        return False, "", ""
 
     async def run(self):
         """Run the proxy"""
         await self.connect_to_backend()
 
-        # Run both directions concurrently
-        await asyncio.gather(
-            self.forward_client_to_backend(),
-            self.forward_backend_to_client()
-        )
+        tasks = [
+            asyncio.create_task(self.forward_client_to_backend()),
+            asyncio.create_task(self.forward_backend_to_client()),
+        ]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
+        await self._close_backend()
+
+    async def _close_backend(self) -> None:
+        if self.backend_ws:
+            try:
+                await self.backend_ws.close()
+            except Exception:
+                pass
 
 
 class WhisperBYOKRequest(BaseModel):
@@ -182,17 +309,21 @@ async def transcribe_with_byok(request: WhisperBYOKRequest) -> dict[str, Any]:
         transcript = response.text.strip()
 
         # Apply guardrail
-        if request.guardrail_enabled and check_text_local(transcript):
-            raise HTTPException(
-                status_code=400,
-                detail="Transcription blocked by guardrail"
-            )
+        if request.guardrail_enabled:
+            passed, reason = check_text_local(transcript)
+            if not passed:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Transcription blocked by guardrail: {reason}"
+                )
 
         return {
             "text": transcript,
             "blocked": False
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,

@@ -1,22 +1,51 @@
-// ── Hybrid Mode: Enterprise (with guardrail) + Personal (pure frontend) ──
+// ── Chrome Extension: direct OpenAI + local lightweight guardrail ──
 
 // Configuration
-const DEFAULT_BACKEND_URL = 'http://localhost:8000';
 const MIN_RECORDING_MS = 500;
 const STRUCTURING_MODEL = 'gpt-4.1';
+const REALTIME_MODEL = 'gpt-realtime-2';
+const TRANSCRIBE_MODEL = 'gpt-4o-transcribe';
+const REALTIME_PRICING = {
+  'gpt-realtime-2': {
+    textInputPer1K: 0.004,
+    textOutputPer1K: 0.024,
+    audioInputPer1K: 0.032,
+    audioOutputPer1K: 0.064
+  },
+  'gpt-4o-realtime-preview-2024-12-17': {
+    textInputPer1K: 0.0055,
+    textOutputPer1K: 0.022,
+    audioInputPer1K: 0.044,
+    audioOutputPer1K: 0.08
+  },
+  'gpt-4o-realtime-preview-2024-10-01': {
+    textInputPer1K: 0.0055,
+    textOutputPer1K: 0.022,
+    audioInputPer1K: 0.11,
+    audioOutputPer1K: 0.22
+  },
+  'gpt-4o-mini-realtime-preview-2024-12-17': {
+    textInputPer1K: 0.00066,
+    textOutputPer1K: 0.00264,
+    audioInputPer1K: 0.011,
+    audioOutputPer1K: 0.022
+  }
+};
+const CHAT_PRICING = {
+  'gpt-4.1': { inputPer1K: 0.002, outputPer1K: 0.008 },
+  'gpt-4.1-mini': { inputPer1K: 0.0004, outputPer1K: 0.0016 },
+  'gpt-4o': { inputPer1K: 0.0025, outputPer1K: 0.01 },
+  'gpt-4o-mini': { inputPer1K: 0.00015, outputPer1K: 0.0006 }
+};
 
 // State
 let config = {
-  connectionMode: 'personal',
-  backendUrl: DEFAULT_BACKEND_URL,
   apiKey: null,
-  voiceMode: 'whisper',
-  realtimeModel: 'gpt-4o-realtime-preview-2024-12-17',
-  whisperModel: 'gpt-4o-transcribe',
   guardrailEnabled: true
 };
 
 let isRecording = false;
+let activeAudioMode = null;
 let recordingStartedAt = 0;
 let conversationHistory = [];
 let currentFormFields = null;
@@ -27,47 +56,202 @@ let realtimeConnected = false;
 const chat = document.getElementById('chat');
 const chatInput = document.getElementById('chat-input');
 const btnSend = document.getElementById('btn-send');
-const btnStart = document.getElementById('btn-start');
+const btnRecord = document.getElementById('btn-record');
+const btnRealtime = document.getElementById('btn-realtime');
 const btnStop = document.getElementById('btn-stop');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const settingsBtn = document.getElementById('settings-btn');
 const settingsDrawer = document.getElementById('settings-drawer');
-const connectionModeSelect = document.getElementById('connection-mode');
-const backendUrlInput = document.getElementById('backend-url');
-const backendUrlGroup = document.getElementById('backend-url-group');
 const apiKeyInput = document.getElementById('api-key-input');
 const toggleKeyBtn = document.getElementById('toggle-key-btn');
-const voiceModeSelect = document.getElementById('voice-mode');
-const voiceModeHint = document.getElementById('voice-mode-hint');
-const realtimeModelSelect = document.getElementById('realtime-model-select');
-const whisperModelSelect = document.getElementById('whisper-model-select');
-const realtimeModelGroup = document.getElementById('realtime-model-group');
-const whisperModelGroup = document.getElementById('whisper-model-group');
 const guardrailEnabled = document.getElementById('guardrail-enabled');
 const guardrailToggleRow = document.getElementById('guardrail-toggle-row');
 const saveSettingsBtn = document.getElementById('save-settings');
 const cancelSettingsBtn = document.getElementById('cancel-settings');
-const modeDescription = document.getElementById('mode-description');
 const keyStatusEl = document.getElementById('key-status');
 const modeChip = document.getElementById('mode-chip');
 const modeChipText = document.getElementById('mode-chip-text');
 const apiStatusEl = document.getElementById('api-status');
 const apiStatusText = document.getElementById('api-status-text');
+const costTotalEl = document.getElementById('cost-total');
+const costSubtitleEl = document.getElementById('cost-subtitle');
+const costTextTokensEl = document.getElementById('cost-text-tokens');
+const costAudioTokensEl = document.getElementById('cost-audio-tokens');
+const costHistorySummaryEl = document.getElementById('cost-history-summary');
+const costHistoryListEl = document.getElementById('cost-history-list');
+const clearCostHistoryBtn = document.getElementById('clear-cost-history');
+
+let costState = {
+  id: null,
+  startedAt: null,
+  mode: '',
+  model: '',
+  inputTokens: 0,
+  outputTokens: 0,
+  audioInputTokens: 0,
+  audioOutputTokens: 0,
+  cost: 0,
+  source: '尚未產生 usage'
+};
+let costHistory = [];
+
+function formatCost(value) {
+  return `$${Number(value || 0).toFixed(6)}`;
+}
+
+function renderCostPanel() {
+  if (!costTotalEl || !costSubtitleEl || !costTextTokensEl || !costAudioTokensEl) return;
+  costTotalEl.textContent = formatCost(costState.cost);
+  costSubtitleEl.textContent = costState.source;
+  costTextTokensEl.textContent = `${costState.inputTokens || 0} / ${costState.outputTokens || 0}`;
+  costAudioTokensEl.textContent = `${costState.audioInputTokens || 0} / ${costState.audioOutputTokens || 0}`;
+}
+
+function renderCostHistory() {
+  if (!costHistorySummaryEl || !costHistoryListEl) return;
+  const total = costHistory.reduce((sum, item) => sum + Number(item.cost || 0), 0);
+  costHistorySummaryEl.textContent = costHistory.length
+    ? `${costHistory.length} 筆，累計 ${formatCost(total)}`
+    : '尚無歷史紀錄';
+  if (!costHistory.length) {
+    costHistoryListEl.innerHTML = '<div class="sp-history-empty">完成一次對話後會出現在這裡</div>';
+    return;
+  }
+  costHistoryListEl.innerHTML = costHistory.slice(0, 20).map((item) => {
+    const when = item.endedAt || item.startedAt || '';
+    const timeText = when ? new Date(when).toLocaleString('zh-TW', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+    const textTokens = `${item.inputTokens || 0}/${item.outputTokens || 0}`;
+    const audioTokens = `${item.audioInputTokens || 0}/${item.audioOutputTokens || 0}`;
+    return `
+      <div class="sp-history-item">
+        <div class="sp-history-title">${renderMarkdown(item.title || item.model || 'Session')}</div>
+        <div class="sp-history-cost">${formatCost(item.cost)}</div>
+        <div class="sp-history-meta">${timeText} · 文字 ${textTokens} · 音訊 ${audioTokens}</div>
+      </div>`;
+  }).join('');
+}
+
+async function loadCostHistory() {
+  const result = await chrome.storage.local.get(['cost_history']);
+  costHistory = Array.isArray(result.cost_history) ? result.cost_history : [];
+  renderCostHistory();
+}
+
+async function persistCostSnapshot() {
+  if (!costState.id || Number(costState.cost || 0) <= 0) return;
+  const entry = {
+    id: costState.id,
+    title: `${costState.mode || 'chat'} · ${costState.model || STRUCTURING_MODEL}`,
+    mode: costState.mode || 'chat',
+    model: costState.model || STRUCTURING_MODEL,
+    startedAt: costState.startedAt,
+    endedAt: new Date().toISOString(),
+    inputTokens: costState.inputTokens || 0,
+    outputTokens: costState.outputTokens || 0,
+    audioInputTokens: costState.audioInputTokens || 0,
+    audioOutputTokens: costState.audioOutputTokens || 0,
+    cost: Number(costState.cost || 0)
+  };
+  const idx = costHistory.findIndex((item) => item.id === entry.id);
+  if (idx >= 0) {
+    costHistory[idx] = entry;
+  } else {
+    costHistory.unshift(entry);
+  }
+  costHistory = costHistory
+    .sort((a, b) => String(b.endedAt || '').localeCompare(String(a.endedAt || '')))
+    .slice(0, 30);
+  await chrome.storage.local.set({ cost_history: costHistory });
+  renderCostHistory();
+}
+
+function schedulePersistCostSnapshot() {
+  persistCostSnapshot().catch((error) => {
+    console.warn('Failed to persist cost history:', error);
+  });
+}
+
+function resetCostPanel(source = '尚未產生 usage', mode = 'chat', model = STRUCTURING_MODEL) {
+  costState = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    startedAt: new Date().toISOString(),
+    mode,
+    model,
+    inputTokens: 0,
+    outputTokens: 0,
+    audioInputTokens: 0,
+    audioOutputTokens: 0,
+    cost: 0,
+    source
+  };
+  renderCostPanel();
+}
+
+function applyCostMeta(meta, source = 'Realtime usage') {
+  if (!meta) return;
+  costState = {
+    ...costState,
+    inputTokens: meta.inputTokens || 0,
+    outputTokens: meta.outputTokens || 0,
+    audioInputTokens: meta.audioInputTokens || 0,
+    audioOutputTokens: meta.audioOutputTokens || 0,
+    cost: Number(meta.cost || 0),
+    source
+  };
+  renderCostPanel();
+  schedulePersistCostSnapshot();
+}
+
+function accumulateRealtimeUsage(event) {
+  const response = event.response || {};
+  const usage = response.usage || {};
+  const inputTokens = usage.input_tokens || 0;
+  const outputTokens = usage.output_tokens || 0;
+  const inDetails = usage.input_token_details || {};
+  const outDetails = usage.output_token_details || {};
+  const audioInputTokens = inDetails.audio_tokens || 0;
+  const audioOutputTokens = outDetails.audio_tokens || 0;
+  const pricing = REALTIME_PRICING[REALTIME_MODEL] || REALTIME_PRICING['gpt-realtime-2'];
+
+  costState.inputTokens += inputTokens;
+  costState.outputTokens += outputTokens;
+  costState.audioInputTokens += audioInputTokens;
+  costState.audioOutputTokens += audioOutputTokens;
+  costState.cost +=
+    (inputTokens / 1000) * pricing.textInputPer1K
+    + (outputTokens / 1000) * pricing.textOutputPer1K
+    + (audioInputTokens / 1000) * pricing.audioInputPer1K
+    + (audioOutputTokens / 1000) * pricing.audioOutputPer1K;
+  costState.cost = Number(costState.cost.toFixed(6));
+  costState.source = 'Realtime usage';
+  renderCostPanel();
+  schedulePersistCostSnapshot();
+}
+
+function accumulateChatUsage(usage, model = STRUCTURING_MODEL) {
+  if (!usage) return;
+  const inputTokens = usage.prompt_tokens || usage.input_tokens || 0;
+  const outputTokens = usage.completion_tokens || usage.output_tokens || 0;
+  const pricing = CHAT_PRICING[model] || CHAT_PRICING[STRUCTURING_MODEL];
+  costState.inputTokens += inputTokens;
+  costState.outputTokens += outputTokens;
+  costState.cost +=
+    (inputTokens / 1000) * pricing.inputPer1K
+    + (outputTokens / 1000) * pricing.outputPer1K;
+  costState.cost = Number(costState.cost.toFixed(6));
+  costState.source = '文字整理 usage（語音轉錄未計入）';
+  renderCostPanel();
+  schedulePersistCostSnapshot();
+}
 
 // ── Settings persistence ──
 async function loadSettings() {
   const result = await chrome.storage.local.get([
-    'connection_mode', 'backend_url', 'openai_api_key',
-    'voice_mode', 'realtime_model', 'whisper_model', 'guardrail_enabled'
+    'openai_api_key', 'guardrail_enabled'
   ]);
 
-  config.connectionMode = result.connection_mode || 'personal';
-  config.backendUrl = result.backend_url || DEFAULT_BACKEND_URL;
   config.apiKey = result.openai_api_key || null;
-  config.voiceMode = result.voice_mode || 'whisper';
-  config.realtimeModel = result.realtime_model || 'gpt-4o-realtime-preview-2024-12-17';
-  config.whisperModel = result.whisper_model || 'gpt-4o-transcribe';
   config.guardrailEnabled = result.guardrail_enabled !== false;
 
   updateModeChip();
@@ -77,22 +261,13 @@ async function loadSettings() {
 
 async function saveSettings() {
   await chrome.storage.local.set({
-    connection_mode: config.connectionMode,
-    backend_url: config.backendUrl,
     openai_api_key: config.apiKey,
-    voice_mode: config.voiceMode,
-    realtime_model: config.realtimeModel,
-    whisper_model: config.whisperModel,
     guardrail_enabled: config.guardrailEnabled
   });
 }
 
 function updateModeChip() {
-  if (config.connectionMode === 'enterprise') {
-    modeChipText.textContent = config.guardrailEnabled ? '企業模式 + Guardrail' : '企業模式';
-  } else {
-    modeChipText.textContent = '個人模式（純前端）';
-  }
+  modeChipText.textContent = config.guardrailEnabled ? '本機 Guardrail 已啟用' : 'Chrome Extension';
 }
 
 function updateStatusBasedOnConfig() {
@@ -100,10 +275,10 @@ function updateStatusBasedOnConfig() {
     updateStatus('disconnected', 'No API Key');
     return;
   }
-  if (config.voiceMode === 'realtime' && realtimeConnected) {
+  if (realtimeConnected) {
     updateStatus('ready', 'Realtime Connected');
   } else {
-    updateStatus('ready', config.connectionMode === 'enterprise' ? 'Ready (Enterprise)' : 'Ready (Personal)');
+    updateStatus('ready', config.guardrailEnabled ? 'Ready (Local Guardrail)' : 'Ready');
   }
 }
 
@@ -119,17 +294,71 @@ function showApiStatus(message, isError = false) {
   setTimeout(() => { apiStatusEl.style.display = 'none'; }, 3000);
 }
 
+function setVoiceControls(activeMode = null) {
+  activeAudioMode = activeMode;
+  const isActive = !!activeMode;
+  btnRecord.style.display = isActive ? 'none' : 'flex';
+  btnRealtime.style.display = isActive ? 'none' : 'flex';
+  btnStop.style.display = isActive ? 'flex' : 'none';
+  btnStop.title = activeMode === 'realtime' ? '停止即時語音' : '停止錄音';
+}
+
 // ── Chat UI ──
-function addMessage(role, content) {
+function addMessage(role, content, msgType) {
   const messageDiv = document.createElement('div');
   messageDiv.className = `sp-message sp-message-${role}`;
+  if (msgType) messageDiv.classList.add(`sp-msg-${msgType}`);
   const bubble = document.createElement('div');
   bubble.className = 'sp-bubble';
+  if (msgType) bubble.classList.add(`sp-bubble-${msgType}`);
   bubble.innerHTML = renderMarkdown(content);
   messageDiv.appendChild(bubble);
   chat.appendChild(messageDiv);
   chat.scrollTop = chat.scrollHeight;
   return bubble;
+}
+
+function addSystemNotice(content) {
+  const div = document.createElement('div');
+  div.className = 'sp-system-notice';
+  div.innerHTML = renderMarkdown(content);
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function addErrorNotice(content) {
+  const div = document.createElement('div');
+  div.className = 'sp-error-notice';
+  div.innerHTML = renderMarkdown(content);
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function errorDetails(error, context = '') {
+  if (!error) return context || 'Unknown error';
+  const parts = [];
+  if (context) parts.push(context);
+  if (typeof error === 'string') {
+    parts.push(`message=${error}`);
+  } else if (error instanceof Error) {
+    if (error.name) parts.push(`name=${error.name}`);
+    if (error.message) parts.push(`message=${error.message}`);
+    if (error.stack) parts.push(`stack=${error.stack}`);
+  } else if (typeof error === 'object') {
+    if (error.type) parts.push(`type=${error.type}`);
+    if (error.code) parts.push(`code=${error.code}`);
+    if (error.param) parts.push(`param=${error.param}`);
+    if (error.message) parts.push(`message=${error.message}`);
+    if (error.detail) parts.push(`detail=${JSON.stringify(error.detail)}`);
+    parts.push(`payload=${JSON.stringify(error)}`);
+  }
+  return parts.join('\n') || String(error);
+}
+
+function reportError(context, error, extra = {}) {
+  const detail = `${errorDetails(error, context)}${Object.keys(extra || {}).length ? `\nevent=${JSON.stringify(extra)}` : ''}`;
+  console.error(`[${context}]`, error, extra, detail);
+  addErrorNotice(`錯誤內容：\n${detail}`);
 }
 
 function renderMarkdown(text) {
@@ -253,7 +482,12 @@ function getToolSchema(formContext) {
 
 function getSystemPrompt(formContext) {
   if (formContext.type === 'predefined') {
-    return formContext.schema.instructions;
+    return `${formContext.schema.instructions}
+
+送表單前的強制規則：
+- 只能填入使用者已明確提供的資料；不可自行編造姓名、原因、日期、地點、費用、時間或作業人員。
+- 使用者資訊不足時一定要先追問，不可以呼叫 fill_form。
+- 只有計算型欄位可以由已知資料推導，例如車資合計可以由每趟費用加總。`;
   }
 
   // Generic prompt for unknown forms
@@ -267,7 +501,9 @@ function getSystemPrompt(formContext) {
 回覆規則：
 - 用繁體中文回覆
 - 每次回覆不超過兩句話
-- 確認完所有欄位後直接呼叫 fill_form`;
+- 只能填入使用者已明確提供的資料，不可自行編造任何欄位值
+- 資訊不足時一定要先追問，不可以呼叫 fill_form
+- 確認所有必填欄位都有明確值後才呼叫 fill_form`;
 
   if (formContext.fields && formContext.fields.length > 0) {
     prompt += '\n\n目前頁面的表單欄位：\n';
@@ -283,49 +519,91 @@ function getSystemPrompt(formContext) {
   return prompt;
 }
 
-// ── Settings UI handlers ──
-connectionModeSelect.addEventListener('change', () => {
-  const mode = connectionModeSelect.value;
-  if (mode === 'enterprise') {
-    modeDescription.textContent = '企業模式：所有請求經過後端檢查';
-    backendUrlGroup.style.display = 'flex';
-    guardrailToggleRow.style.display = 'flex';
-    const realtimeOption = voiceModeSelect.querySelector('option[value="realtime"]');
-    if (realtimeOption) realtimeOption.disabled = false;
-  } else {
-    modeDescription.textContent = '個人模式：直接調用 OpenAI API，支援即時與錄音';
-    backendUrlGroup.style.display = 'none';
-    guardrailToggleRow.style.display = 'none';
-    const realtimeOption = voiceModeSelect.querySelector('option[value="realtime"]');
-    if (realtimeOption) realtimeOption.disabled = false;
-  }
-});
+function getToolParameters(formContext) {
+  if (!formContext) return null;
+  const tool = getToolSchema(formContext);
+  return tool?.function?.parameters || null;
+}
 
-voiceModeSelect.addEventListener('change', () => {
-  const mode = voiceModeSelect.value;
-  if (mode === 'realtime') {
-    voiceModeHint.textContent = '即時對話：低延遲串流，AI 即時回應';
-    realtimeModelGroup.style.display = 'flex';
-    whisperModelGroup.style.display = 'none';
-  } else {
-    voiceModeHint.textContent = '錄音轉譯：錄完後一次轉文字再處理';
-    realtimeModelGroup.style.display = 'none';
-    whisperModelGroup.style.display = 'flex';
+function isBlankValue(value) {
+  if (value === null || value === undefined) return true;
+  if (typeof value === 'string') return value.trim() === '';
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === 'object') return Object.keys(value).length === 0;
+  return false;
+}
+
+function isVagueValue(value) {
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  return [
+    '未提供', '待補', '不知道', '不清楚', '不確定', '沒有提供',
+    'n/a', 'na', 'none', 'unknown', 'tbd',
+    '隨便', '任意', '都可以', '你決定', '自動產生', '自行判斷'
+  ].some((term) => normalized.includes(term));
+}
+
+function validateValueAgainstSchema(value, schema, label, issues) {
+  if (!schema) return;
+  if (isBlankValue(value)) {
+    issues.push(`${label} 缺少內容`);
+    return;
   }
-});
+  if (isVagueValue(value)) {
+    issues.push(`${label} 內容不夠明確`);
+    return;
+  }
+  if (schema.enum && typeof value === 'string' && !schema.enum.includes(value)) {
+    issues.push(`${label} 必須是有效選項`);
+  }
+  if (schema.pattern && typeof value === 'string' && !(new RegExp(schema.pattern).test(value))) {
+    issues.push(`${label} 格式不正確`);
+  }
+  if (schema.type === 'array') {
+    if (!Array.isArray(value)) {
+      issues.push(`${label} 必須是清單`);
+      return;
+    }
+    if (schema.minItems && value.length < schema.minItems) {
+      issues.push(`${label} 至少需要 ${schema.minItems} 筆`);
+    }
+    value.forEach((item, idx) => validateValueAgainstSchema(item, schema.items, `${label} 第 ${idx + 1} 筆`, issues));
+  }
+  if (schema.type === 'object' && schema.properties && typeof value === 'object' && !Array.isArray(value)) {
+    for (const key of schema.required || []) {
+      validateValueAgainstSchema(value[key], schema.properties[key], `${label}.${key}`, issues);
+    }
+  }
+}
+
+function validateFillPayload(payload, formContext) {
+  const params = getToolParameters(formContext);
+  const issues = [];
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { ok: false, issues: ['填表資料格式不正確'] };
+  }
+  if (!params?.properties) {
+    return { ok: false, issues: ['無法確認目前表單欄位'] };
+  }
+  for (const key of params.required || []) {
+    validateValueAgainstSchema(payload[key], params.properties[key], key, issues);
+  }
+  return { ok: issues.length === 0, issues };
+}
+
+function buildMissingInfoMessage(issues) {
+  const list = issues.slice(0, 5).map((item) => `- ${item}`).join('\n');
+  const suffix = issues.length > 5 ? `\n- 另外還有 ${issues.length - 5} 項需要補齊` : '';
+  return `目前資訊還不夠，先不填表。請補充：\n${list}${suffix}`;
+}
 
 settingsBtn.addEventListener('click', () => {
   const isHidden = settingsDrawer.hasAttribute('hidden');
   if (isHidden) {
-    connectionModeSelect.value = config.connectionMode;
-    backendUrlInput.value = config.backendUrl;
     apiKeyInput.value = config.apiKey || '';
-    voiceModeSelect.value = config.voiceMode;
-    realtimeModelSelect.value = config.realtimeModel;
-    whisperModelSelect.value = config.whisperModel;
     guardrailEnabled.checked = config.guardrailEnabled;
-    connectionModeSelect.dispatchEvent(new Event('change'));
-    voiceModeSelect.dispatchEvent(new Event('change'));
+    guardrailToggleRow.style.display = 'flex';
     settingsDrawer.removeAttribute('hidden');
   } else {
     settingsDrawer.setAttribute('hidden', '');
@@ -349,12 +627,7 @@ saveSettingsBtn.addEventListener('click', async () => {
     return;
   }
 
-  config.connectionMode = connectionModeSelect.value;
-  config.backendUrl = backendUrlInput.value.trim() || DEFAULT_BACKEND_URL;
   config.apiKey = newKey;
-  config.voiceMode = voiceModeSelect.value;
-  config.realtimeModel = realtimeModelSelect.value;
-  config.whisperModel = whisperModelSelect.value;
   config.guardrailEnabled = guardrailEnabled.checked;
 
   await saveSettings();
@@ -374,6 +647,12 @@ cancelSettingsBtn.addEventListener('click', () => {
   settingsDrawer.setAttribute('hidden', '');
 });
 
+clearCostHistoryBtn?.addEventListener('click', async () => {
+  costHistory = [];
+  await chrome.storage.local.set({ cost_history: [] });
+  renderCostHistory();
+});
+
 // ══════════════════════════════════════════════════════════════
 // ── WHISPER MODE: Record → Transcribe → Function Call → Fill ──
 // ══════════════════════════════════════════════════════════════
@@ -382,6 +661,7 @@ let micPermissionGranted = false;
 
 async function startWhisperRecording() {
   try {
+    resetCostPanel('錄音轉譯準備中', 'whisper', STRUCTURING_MODEL);
     if (!micPermissionGranted) {
       updateStatus('active', 'Requesting microphone permission...');
       const permResponse = await chrome.runtime.sendMessage({
@@ -409,8 +689,7 @@ async function startWhisperRecording() {
 
     recordingStartedAt = Date.now();
     isRecording = true;
-    btnStart.style.display = 'none';
-    btnStop.style.display = 'block';
+    setVoiceControls('record');
     updateStatus('recording', 'Recording...');
   } catch (error) {
     console.error('Failed to start recording:', error);
@@ -426,13 +705,23 @@ async function stopWhisperRecording() {
     const duration = Date.now() - recordingStartedAt;
 
     if (duration < MIN_RECORDING_MS) {
-      addMessage('assistant', '🎤 錄音時間太短（至少0.5秒），請重試');
+      addSystemNotice('🎤 錄音時間太短（至少0.5秒），請重試');
+      try {
+        await chrome.runtime.sendMessage({
+          target: 'offscreen',
+          action: 'stop_recording'
+        });
+      } catch (cleanupError) {
+        console.warn('Failed to cleanup short recording:', cleanupError);
+      }
       updateStatusBasedOnConfig();
       isRecording = false;
-      btnStart.style.display = 'block';
-      btnStop.style.display = 'none';
+      setVoiceControls(null);
       return;
     }
+
+    isRecording = false;
+    setVoiceControls(null);
 
     const response = await chrome.runtime.sendMessage({
       target: 'offscreen',
@@ -440,33 +729,37 @@ async function stopWhisperRecording() {
     });
 
     if (!response || !response.success) {
-      throw new Error(response?.error || 'Failed to stop recording');
+      const err = new Error(response?.error || 'Failed to stop recording');
+      if (response?.errorName) err.name = response.errorName;
+      if (response?.stack) err.stack = response.stack;
+      throw err;
     }
 
-    isRecording = false;
-    btnStart.style.display = 'block';
-    btnStop.style.display = 'none';
-
-    const audioBlob = base64ToBlob(response.audioData, 'audio/webm');
+    const audioBlob = base64ToBlob(response.audioData, 'audio/webm;codecs=opus');
 
     updateStatus('active', 'Transcribing...');
     const transcript = await transcribeAudio(audioBlob);
 
     if (!transcript) {
-      addMessage('assistant', '🎤 沒有辨識到語音，請重試');
+      addSystemNotice('🎤 沒有辨識到語音，請重試');
       updateStatusBasedOnConfig();
       return;
     }
 
-    addMessage('user', `🎤 ${transcript}`);
+    addMessage('user', `${transcript}`);
     await handleUserMessage(transcript);
   } catch (error) {
     console.error('Stop recording error:', error);
-    addMessage('assistant', `❌ 錄音處理失敗: ${error.message}`);
+    if (error.message && error.message.includes('guardrail')) {
+      const reasonMatch = error.message.match(/guardrail:\s*(.+)$/i);
+      const reason = reasonMatch ? reasonMatch[1] : '內容不安全';
+      addGuardrailChip('input', false, reason);
+    } else {
+      reportError('錄音處理失敗', error);
+    }
     updateStatus('error', 'Error');
     isRecording = false;
-    btnStart.style.display = 'block';
-    btnStop.style.display = 'none';
+    setVoiceControls(null);
   }
 }
 
@@ -474,43 +767,22 @@ async function stopWhisperRecording() {
 async function transcribeAudio(audioBlob) {
   if (!config.apiKey) throw new Error('請先在設定中填入 OpenAI API Key');
 
-  if (config.connectionMode === 'enterprise') {
-    const audioBase64 = await blobToBase64(audioBlob);
-    const response = await fetch(`${config.backendUrl}/api/byok-transcribe`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key: config.apiKey,
-        audio_base64: audioBase64.split(',')[1],
-        model: config.whisperModel,
-        language: 'zh',
-        guardrail_enabled: config.guardrailEnabled
-      })
-    });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.detail || 'Transcription failed');
-    }
-    return (await response.json()).text;
-  } else {
-    const formData = new FormData();
-    formData.append('model', config.whisperModel);
-    formData.append('file', audioBlob, 'recording.webm');
-    formData.append('response_format', 'json');
-    formData.append('language', 'zh');
-    if (config.whisperModel === 'whisper-1') {
-      formData.append('prompt', '以下是繁體中文語音輸入，用於填寫表單。');
-    }
+  const formData = new FormData();
+  formData.append('model', TRANSCRIBE_MODEL);
+  const audioFile = new File([audioBlob], 'recording.webm', { type: 'audio/webm' });
+  formData.append('file', audioFile);
+  formData.append('response_format', 'json');
+  formData.append('language', 'zh-TW');
+  formData.append('prompt', '以下是臺灣繁體中文語音輸入，請使用繁體中文輸出。');
 
-    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${config.apiKey}` },
-      body: formData
-    });
+  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${config.apiKey}` },
+    body: formData
+  });
 
-    if (!response.ok) throw new Error(`Whisper failed: ${await response.text()}`);
-    return (await response.json()).text.trim();
-  }
+  if (!response.ok) throw new Error(`Whisper failed: ${await response.text()}`);
+  return (await response.json()).text.trim();
 }
 
 // ── Guardrail UI helper ──
@@ -535,17 +807,16 @@ function addGuardrailChip(side, passed, reason) {
 async function handleUserMessage(text) {
   if (!text.trim()) return;
   if (!config.apiKey) {
-    addMessage('assistant', '❌ 請先在設定中填入 OpenAI API Key');
+    addErrorNotice('請先在設定中填入 OpenAI API Key');
     return;
   }
 
-  // ── Input Guardrail ──
+  // ── Input Guardrail (local browser check) ──
   if (config.guardrailEnabled) {
     const inputCheck = checkGuardrail(text);
     addGuardrailChip('input', inputCheck.passed, inputCheck.reason);
 
     if (!inputCheck.passed) {
-      addMessage('assistant', `🚫 輸入被安全機制阻攔\n\n類別：**${inputCheck.reason}**\n偵測到：「${inputCheck.matched}」\n\n此內容無法處理，請重新描述您的需求。`);
       updateStatusBasedOnConfig();
       return;
     }
@@ -556,13 +827,13 @@ async function handleUserMessage(text) {
   // Detect form context (predefined schema or generic fields)
   const formContext = await detectFormContext();
   if (!formContext) {
-    addMessage('assistant', '⚠️ 目前頁面沒有偵測到表單欄位。請切換到有表單的頁面再試。');
+    addSystemNotice('⚠️ 目前頁面沒有偵測到表單欄位。請切換到有表單的頁面再試。');
     updateStatusBasedOnConfig();
     return;
   }
 
   if (formContext.type === 'predefined' && conversationHistory.length === 0) {
-    addMessage('assistant', `📋 偵測到：**${formContext.schema.label}**`);
+    addSystemNotice(`📋 偵測到：**${formContext.schema.label}**`);
   }
 
   // Build conversation
@@ -597,16 +868,16 @@ async function handleUserMessage(text) {
     }
 
     const data = await response.json();
+    accumulateChatUsage(data.usage, STRUCTURING_MODEL);
     const choice = data.choices[0];
     const msg = choice.message;
 
-    // ── Output Guardrail ──
+    // ── Output Guardrail (local browser check) ──
     if (config.guardrailEnabled && msg.content) {
       const outputCheck = checkGuardrail(msg.content);
       addGuardrailChip('output', outputCheck.passed, outputCheck.reason);
 
       if (!outputCheck.passed) {
-        addMessage('assistant', `🚫 AI 回應被安全機制阻攔\n\n類別：**${outputCheck.reason}**`);
         conversationHistory.push({ role: 'assistant', content: '[blocked by guardrail]' });
         updateStatusBasedOnConfig();
         return;
@@ -620,6 +891,19 @@ async function handleUserMessage(text) {
       const toolCall = msg.tool_calls[0];
       if (toolCall.function.name === 'fill_form') {
         const payload = JSON.parse(toolCall.function.arguments);
+        const readiness = validateFillPayload(payload, formContext);
+        if (!readiness.ok) {
+          const prompt = buildMissingInfoMessage(readiness.issues);
+          addMessage('assistant', prompt);
+          conversationHistory.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({ status: 'blocked_insufficient_info', issues: readiness.issues })
+          });
+          conversationHistory.push({ role: 'assistant', content: prompt });
+          updateStatusBasedOnConfig();
+          return;
+        }
         addMessage('assistant', '✅ 正在填入表單...');
         updateStatus('active', 'Filling form...');
 
@@ -629,7 +913,7 @@ async function handleUserMessage(text) {
         } catch (fillError) {
           // Fill failed - still need to record tool response for conversation continuity
           result = { filled: [], failed: [{ key: '_all', reason: fillError.message }] };
-          addMessage('assistant', `❌ 填表失敗: ${fillError.message}\n\n可能需要重新整理表單頁面。`);
+          addErrorNotice(`填表失敗: ${fillError.message}`);
         }
 
         if (result.filled && result.filled.length > 0 && (!result.failed || result.failed.length === 0)) {
@@ -656,9 +940,9 @@ async function handleUserMessage(text) {
     // If API error due to broken conversation, reset history
     if (error.message.includes('tool_call_id') || error.message.includes('tool_calls')) {
       conversationHistory = [];
-      addMessage('assistant', `⚠️ 對話記錄已重置。請重新描述您要填寫的內容。`);
+      addSystemNotice('⚠️ 對話記錄已重置，請重新描述。');
     } else {
-      addMessage('assistant', `❌ 錯誤: ${error.message}`);
+      reportError('對話處理失敗', error);
     }
     updateStatus('error', 'Error');
   }
@@ -670,17 +954,24 @@ async function handleUserMessage(text) {
 
 let realtimeAudioContext = null;
 let realtimeAgentBubble = null;
+let realtimeOutputBuffer = '';
+let realtimeOutputBlocked = false;
+let realtimeFormContext = null;
+let realtimeResponseActive = false;
+let realtimeResponsePending = false;
 
 async function startRealtimeSession() {
   if (!config.apiKey) {
-    addMessage('assistant', '❌ 請先在設定中填入 OpenAI API Key');
+    addErrorNotice('請先在設定中填入 OpenAI API Key');
     return;
   }
 
   if (realtimeWs && realtimeWs.readyState === WebSocket.OPEN) {
-    addMessage('assistant', '⚠️ 即時連線已在進行中');
+    addSystemNotice('⚠️ 即時連線已在進行中');
     return;
   }
+
+  resetCostPanel('Realtime 連線中', 'realtime', REALTIME_MODEL);
 
   // Ensure mic permission
   if (!micPermissionGranted) {
@@ -689,7 +980,7 @@ async function startRealtimeSession() {
       action: 'request_mic_permission'
     });
     if (!permResponse || !permResponse.success) {
-      addMessage('assistant', '❌ 麥克風權限被拒絕');
+      addErrorNotice('麥克風權限被拒絕');
       return;
     }
     micPermissionGranted = true;
@@ -698,55 +989,72 @@ async function startRealtimeSession() {
   // Detect form context
   const formContext = await detectFormContext();
   if (!formContext) {
-    addMessage('assistant', '⚠️ 目前頁面沒有偵測到表單欄位。請切換到有表單的頁面再試。');
+    addSystemNotice('⚠️ 目前頁面沒有偵測到表單欄位。請切換到有表單的頁面再試。');
     return;
   }
 
   if (formContext.type === 'predefined') {
-    addMessage('assistant', `📋 偵測到：**${formContext.schema.label}**`);
+    addSystemNotice(`📋 偵測到：**${formContext.schema.label}**`);
   }
+  realtimeFormContext = formContext;
 
   updateStatus('active', 'Connecting to Realtime API...');
-  addMessage('assistant', '🔄 連接即時語音...');
+  addSystemNotice('🔄 連接即時語音...');
 
   try {
-    if (config.connectionMode === 'enterprise') {
-      await startRealtimeEnterprise(formContext);
-    } else {
-      await startRealtimePersonal(formContext);
-    }
+    await startRealtimePersonal(formContext);
   } catch (error) {
-    console.error('Realtime connection error:', error);
-    addMessage('assistant', `❌ 即時連線失敗: ${error.message}`);
+    reportError('即時連線失敗', error);
     updateStatus('error', 'Connection failed');
   }
 }
 
-async function startRealtimePersonal(formContext) {
-  const url = `wss://api.openai.com/v1/realtime?model=${config.realtimeModel}`;
+function isGAModel(model) {
+  return model.startsWith('gpt-realtime');
+}
 
-  realtimeWs = new WebSocket(url, [
-    'realtime',
-    `openai-insecure-api-key.${config.apiKey}`,
-    'openai-beta.realtime-v1'
-  ]);
+function buildSessionUpdate(formContext) {
+  const systemPrompt = getSystemPrompt(formContext);
+  const tool = getToolSchema(formContext);
 
-  realtimeWs.onopen = () => {
-    realtimeConnected = true;
-    updateStatus('ready', 'Realtime Connected');
+  const realtimeTool = {
+    type: 'function',
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters
+  };
 
-    const systemPrompt = getSystemPrompt(formContext);
-    const tool = getToolSchema(formContext);
-
-    // Realtime API tool format is slightly different from Chat Completions
-    const realtimeTool = {
-      type: 'function',
-      name: tool.function.name,
-      description: tool.function.description,
-      parameters: tool.function.parameters
+  if (isGAModel(REALTIME_MODEL)) {
+    // GA API format (gpt-realtime-2)
+    return {
+      type: 'session.update',
+      session: {
+        type: 'realtime',
+        model: REALTIME_MODEL,
+        output_modalities: ['text'],
+        instructions: systemPrompt,
+        audio: {
+          input: {
+            format: {
+              type: 'audio/pcm',
+              rate: 24000
+            },
+            transcription: { model: 'whisper-1' },
+            turn_detection: {
+              type: 'server_vad',
+              create_response: !config.guardrailEnabled,
+              threshold: 0.85,
+              silence_duration_ms: 1000
+            }
+          }
+        },
+        tools: [realtimeTool],
+        tool_choice: 'auto'
+      }
     };
-
-    realtimeWs.send(JSON.stringify({
+  } else {
+    // Beta API format (gpt-4o-realtime-preview)
+    return {
       type: 'session.update',
       session: {
         modalities: ['text', 'audio'],
@@ -756,15 +1064,39 @@ async function startRealtimePersonal(formContext) {
         input_audio_transcription: { model: 'whisper-1' },
         turn_detection: {
           type: 'server_vad',
+          create_response: !config.guardrailEnabled,
           threshold: 0.85,
           silence_duration_ms: 1000
         },
         tools: [realtimeTool],
         tool_choice: 'auto'
       }
-    }));
+    };
+  }
+}
 
-    addMessage('assistant', '🎙️ 即時語音已連接！開始說話即可，AI 會即時回應並在資訊完整時自動填表。');
+async function startRealtimePersonal(formContext) {
+  const url = `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
+
+  const protocols = [
+    'realtime',
+    `openai-insecure-api-key.${config.apiKey}`
+  ];
+  if (!isGAModel(REALTIME_MODEL)) {
+    protocols.push('openai-beta.realtime-v1');
+  }
+
+  realtimeWs = new WebSocket(url, protocols);
+
+  realtimeWs.onopen = () => {
+    realtimeConnected = true;
+    realtimeResponseActive = false;
+    realtimeResponsePending = false;
+    updateStatus('ready', 'Realtime Connected');
+
+    realtimeWs.send(JSON.stringify(buildSessionUpdate(formContext)));
+
+    addSystemNotice('🎙️ 即時語音已連接！開始說話即可。');
     startRealtimeAudioCapture();
   };
 
@@ -774,49 +1106,7 @@ async function startRealtimePersonal(formContext) {
 
   realtimeWs.onerror = (error) => {
     console.error('WebSocket error:', error);
-    addMessage('assistant', '❌ WebSocket 連線錯誤');
-    disconnectRealtime();
-  };
-
-  realtimeWs.onclose = () => {
-    disconnectRealtime();
-  };
-}
-
-async function startRealtimeEnterprise(formContext) {
-  const wsUrl = config.backendUrl.replace(/^http/, 'ws');
-  const params = new URLSearchParams({
-    model: config.realtimeModel,
-    guardrail: config.guardrailEnabled ? 'keyword' : 'none'
-  });
-
-  // If we matched a predefined form, pass its ID
-  if (formContext.type === 'predefined') {
-    params.set('form', formContext.schema.id);
-  }
-
-  realtimeWs = new WebSocket(`${wsUrl}/ws/byok-realtime?${params}`);
-
-  realtimeWs.onopen = () => {
-    realtimeConnected = true;
-    updateStatus('ready', 'Realtime Connected (Enterprise)');
-
-    realtimeWs.send(JSON.stringify({
-      type: 'init',
-      api_key: config.apiKey,
-      form_id: formContext.type === 'predefined' ? formContext.schema.id : null
-    }));
-
-    addMessage('assistant', '🎙️ 即時語音已連接（企業模式）！開始說話即可。');
-    startRealtimeAudioCapture();
-  };
-
-  realtimeWs.onmessage = (event) => {
-    handleRealtimeEvent(JSON.parse(event.data));
-  };
-
-  realtimeWs.onerror = () => {
-    addMessage('assistant', '❌ 企業模式 WebSocket 連線錯誤');
+    addErrorNotice('WebSocket 連線錯誤');
     disconnectRealtime();
   };
 
@@ -827,24 +1117,85 @@ async function startRealtimeEnterprise(formContext) {
 
 let realtimeToolCallBuffer = '';
 
+function requestRealtimeResponse() {
+  if (!realtimeWs || realtimeWs.readyState !== WebSocket.OPEN) return;
+  if (realtimeResponseActive) {
+    realtimeResponsePending = true;
+    return;
+  }
+  realtimeResponseActive = true;
+  realtimeWs.send(JSON.stringify({ type: 'response.create' }));
+}
+
+function flushPendingRealtimeResponse() {
+  if (!realtimeResponsePending) return;
+  realtimeResponsePending = false;
+  setTimeout(() => requestRealtimeResponse(), 0);
+}
+
 function handleRealtimeEvent(event) {
   const type = event.type;
+  console.log('[Realtime event]', type, type.includes('transcription') ? event : '');
 
   if (type === 'session.created' || type === 'session.updated') {
     console.log('Realtime session configured');
+  } else if (type === 'response.created') {
+    realtimeResponseActive = true;
+    realtimeOutputBuffer = '';
+    realtimeOutputBlocked = false;
   } else if (type === 'conversation.item.input_audio_transcription.completed') {
-    const transcript = event.transcript;
-    if (transcript && transcript.trim()) {
-      addMessage('user', `🎤 ${transcript}`);
+    const transcript = event.transcript || event.text || '';
+    if (transcript.trim()) {
+      addMessage('user', `🎤 ${transcript.trim()}`);
     }
-  } else if (type === 'response.audio_transcript.delta' || type === 'response.text.delta') {
+    if (config.guardrailEnabled && transcript.trim()) {
+      const inputCheck = checkGuardrail(transcript);
+      addGuardrailChip('input', inputCheck.passed, inputCheck.reason);
+      if (!inputCheck.passed) {
+        updateStatusBasedOnConfig();
+        return;
+      }
+      requestRealtimeResponse();
+    }
+  } else if (type === 'conversation.item.input_audio_transcription.failed') {
+    console.warn('Transcription failed:', event.error);
+    reportError('語音轉錄失敗', event.error || event);
+  } else if (type === 'input_audio_buffer.speech_started') {
+    updateStatus('recording', 'Speaking...');
+  } else if (type === 'input_audio_buffer.speech_stopped') {
+    updateStatus('active', 'Processing...');
+  } else if (type === 'response.audio_transcript.delta' || type === 'response.text.delta' || type === 'response.output_text.delta') {
+    const delta = event.delta || '';
+    if (config.guardrailEnabled && !realtimeOutputBlocked) {
+      realtimeOutputBuffer += delta;
+      const outputCheck = checkGuardrail(realtimeOutputBuffer);
+      if (!outputCheck.passed) {
+        realtimeOutputBlocked = true;
+        addGuardrailChip('output', false, outputCheck.reason);
+        if (realtimeWs?.readyState === WebSocket.OPEN) {
+          realtimeWs.send(JSON.stringify({ type: 'response.cancel' }));
+        }
+        realtimeAgentBubble = null;
+        updateStatusBasedOnConfig();
+        return;
+      }
+    }
+    if (realtimeOutputBlocked) return;
     // Streaming AI response
     if (!realtimeAgentBubble) {
       realtimeAgentBubble = addMessage('assistant', '');
     }
-    realtimeAgentBubble.innerHTML += renderMarkdown(event.delta || '');
+    realtimeAgentBubble.innerHTML += renderMarkdown(delta);
     chat.scrollTop = chat.scrollHeight;
-  } else if (type === 'response.done' || type === 'response.output_text.done') {
+  } else if (type === 'response.done') {
+    realtimeResponseActive = false;
+    accumulateRealtimeUsage(event);
+    if (config.guardrailEnabled && realtimeOutputBuffer.trim() && !realtimeOutputBlocked) {
+      addGuardrailChip('output', true, '');
+    }
+    realtimeAgentBubble = null;
+    flushPendingRealtimeResponse();
+  } else if (type === 'response.output_text.done') {
     realtimeAgentBubble = null;
   } else if (type === 'response.function_call_arguments.delta') {
     realtimeToolCallBuffer += event.delta || '';
@@ -856,20 +1207,45 @@ function handleRealtimeEvent(event) {
     // Play audio (optional - requires AudioContext)
     // For now, text response is shown
   } else if (type === 'error') {
-    const errMsg = event.error?.message || event.message || 'Unknown error';
-    addMessage('assistant', `❌ Realtime error: ${errMsg}`);
-  } else if (type === 'form_ready') {
-    // Enterprise mode: backend already parsed form
-    handleRealtimeFormFill(event.payload);
-  } else if (type === 'browser_fill_done') {
-    addMessage('assistant', '✅ 表單已由後端自動填入！');
+    const errMsg = event.error?.message || event.message || event.error || 'Unknown error';
+    if (event.error?.code === 'conversation_already_has_active_response') {
+      realtimeResponseActive = true;
+      realtimeResponsePending = true;
+      console.warn('Realtime response already active; queued next response.create');
+      return;
+    }
+    reportError('Realtime error', event.error || new Error(errMsg), event);
+    disconnectRealtime();
+  } else if (type === 'guardrail_chat') {
+    addGuardrailChip(event.side || 'input', !!event.passed, event.reason || '');
+    if (!event.passed && event.side === 'input') {
+      updateStatusBasedOnConfig();
+    }
   }
 }
 
 async function handleRealtimeToolCall(argsStr, callId) {
   try {
     const payload = JSON.parse(argsStr);
-    addMessage('assistant', '✅ AI 判斷資訊完整，正在填入表單...');
+    const readiness = validateFillPayload(payload, realtimeFormContext || await detectFormContext());
+    if (!readiness.ok) {
+      const prompt = buildMissingInfoMessage(readiness.issues);
+      addMessage('assistant', prompt);
+      if (realtimeWs && realtimeWs.readyState === WebSocket.OPEN) {
+        realtimeWs.send(JSON.stringify({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: JSON.stringify({ status: 'blocked_insufficient_info', issues: readiness.issues })
+          }
+        }));
+        requestRealtimeResponse();
+      }
+      updateStatusBasedOnConfig();
+      return;
+    }
+    addSystemNotice('✅ AI 判斷資訊完整，正在填入表單...');
     updateStatus('active', 'Filling form...');
 
     const result = await fillFormOnPage(payload);
@@ -893,12 +1269,12 @@ async function handleRealtimeToolCall(argsStr, callId) {
           output: JSON.stringify({ status: 'success', ...result })
         }
       }));
-      realtimeWs.send(JSON.stringify({ type: 'response.create' }));
+      requestRealtimeResponse();
     }
 
     updateStatusBasedOnConfig();
   } catch (error) {
-    addMessage('assistant', `❌ 填表失敗: ${error.message}`);
+    reportError('填表失敗', error);
     if (realtimeWs && realtimeWs.readyState === WebSocket.OPEN) {
       realtimeWs.send(JSON.stringify({
         type: 'conversation.item.create',
@@ -908,7 +1284,7 @@ async function handleRealtimeToolCall(argsStr, callId) {
           output: JSON.stringify({ status: 'error', message: error.message })
         }
       }));
-      realtimeWs.send(JSON.stringify({ type: 'response.create' }));
+      requestRealtimeResponse();
     }
   }
 }
@@ -921,58 +1297,67 @@ async function handleRealtimeFormFill(payload) {
     if (result.failed?.length > 0) msg += `\n⚠️ ${result.failed.length} 個欄位失敗`;
     addMessage('assistant', msg || '✅ 表單已填入！');
   } catch (error) {
-    addMessage('assistant', `❌ 填表失敗: ${error.message}`);
+    addErrorNotice(`填表失敗: ${error.message}`);
   }
 }
 
-// ── Realtime Audio Capture ──
-let audioStream = null;
-let audioProcessor = null;
+// ── Realtime Audio Capture (PCM16 streaming) ──
 
 async function startRealtimeAudioCapture() {
   try {
-    // Start recording via offscreen document for raw PCM
     const startResp = await chrome.runtime.sendMessage({
       target: 'offscreen',
-      action: 'start_recording'
+      action: 'start_pcm_stream'
     });
 
     if (!startResp || !startResp.success) {
-      // Fallback: Use direct getUserMedia if in permission-granted popup window
-      throw new Error(startResp?.error || 'Cannot start audio capture');
+      const err = new Error(startResp?.error || 'Cannot start audio capture');
+      if (startResp?.errorName) err.name = startResp.errorName;
+      if (startResp?.stack) err.stack = startResp.stack;
+      throw err;
     }
 
     isRecording = true;
-    btnStart.style.display = 'none';
-    btnStop.style.display = 'block';
+    setVoiceControls('realtime');
     updateStatus('recording', 'Listening...');
   } catch (error) {
     console.error('Audio capture error:', error);
-    addMessage('assistant', `⚠️ 音訊擷取失敗: ${error.message}\n\n嘗試使用錄音模式作為備選。`);
+    reportError('音訊擷取失敗', error);
   }
 }
 
+// Listen for PCM audio data from offscreen document
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.target === 'sidepanel' && message.action === 'pcm_audio_data') {
+    if (realtimeWs && realtimeWs.readyState === WebSocket.OPEN) {
+      realtimeWs.send(JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio: message.audioData
+      }));
+    }
+  }
+});
+
 function disconnectRealtime() {
   realtimeConnected = false;
+  realtimeFormContext = null;
+  realtimeResponseActive = false;
+  realtimeResponsePending = false;
+  chrome.runtime.sendMessage({ target: 'offscreen', action: 'stop_pcm_stream' }).catch(() => {});
   if (realtimeWs) {
-    if (realtimeWs.readyState === WebSocket.OPEN) {
+    if (realtimeWs.readyState === WebSocket.OPEN || realtimeWs.readyState === WebSocket.CONNECTING) {
       realtimeWs.close();
     }
     realtimeWs = null;
   }
   isRecording = false;
-  btnStart.style.display = 'block';
-  btnStop.style.display = 'none';
+  setVoiceControls(null);
   updateStatusBasedOnConfig();
 }
 
 function stopRealtimeSession() {
-  if (realtimeWs) {
-    // Stop sending audio
-    chrome.runtime.sendMessage({ target: 'offscreen', action: 'stop_recording' }).catch(() => {});
-    disconnectRealtime();
-    addMessage('assistant', '🔌 即時語音已斷開');
-  }
+  disconnectRealtime();
+  addSystemNotice('🔌 即時語音已斷開');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -992,7 +1377,7 @@ function handleRecordingError(error) {
     errorMessage = `麥克風錯誤：${error.message}`;
   }
 
-  addMessage('assistant', `❌ ${errorMessage}`);
+  addErrorNotice(errorMessage);
   updateStatusBasedOnConfig();
 }
 
@@ -1015,20 +1400,22 @@ function blobToBase64(blob) {
 }
 
 // ── Event handlers ──
-btnStart.addEventListener('click', () => {
-  if (config.voiceMode === 'realtime') {
-    if (realtimeConnected) {
-      // Already connected, do nothing (listening is automatic)
-      return;
-    }
-    startRealtimeSession();
-  } else {
-    startWhisperRecording();
+btnRecord.addEventListener('click', () => {
+  if (isRecording || realtimeConnected) return;
+  startWhisperRecording();
+});
+
+btnRealtime.addEventListener('click', () => {
+  if (realtimeConnected) {
+    stopRealtimeSession();
+    return;
   }
+  if (isRecording) return;
+  startRealtimeSession();
 });
 
 btnStop.addEventListener('click', () => {
-  if (config.voiceMode === 'realtime') {
+  if (activeAudioMode === 'realtime' || realtimeConnected) {
     stopRealtimeSession();
   } else {
     stopWhisperRecording();
@@ -1054,11 +1441,12 @@ chatInput.addEventListener('keydown', (e) => {
 // ── Init ──
 (async () => {
   await loadSettings();
+  await loadCostHistory();
+  renderCostPanel();
 
   if (!config.apiKey) {
-    addMessage('assistant', '👋 歡迎使用語音填表助理！\n\n請先點擊右上角 ⚙️ 設定按鈕，輸入你的 OpenAI API Key。\n\n支援兩種模式：\n• **即時對話** - AI 即時聽取語音並自動填表\n• **錄音轉譯** - 錄完後轉文字，再由 AI 判斷填表');
+    addMessage('assistant', '歡迎使用語音填表助理。\n\n請先點擊右上角設定按鈕，輸入 OpenAI API Key。底部麥克風是錄音轉文字，波形按鈕是即時語音對話。');
   } else {
-    const modeText = config.voiceMode === 'realtime' ? '即時對話' : '錄音轉譯';
-    addMessage('assistant', `👋 準備好了！模式：${modeText}\n\n請切換到有表單的頁面，然後按麥克風按鈕開始語音填表。`);
+    addMessage('assistant', '準備好了。請切換到有表單的頁面，輸入文字、按麥克風錄音，或按波形開始即時語音。');
   }
 })();
